@@ -1,3 +1,4 @@
 - renovate-config: "renovate/default-renovate-distribution.json"
   sync-repositories:
     - name: "rhoai-rhtap/odh-ai-fifth-demo"
+    - name: "rhoai-rhtap/odh-ai-sixth-demo"
