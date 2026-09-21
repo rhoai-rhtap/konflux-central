@@ -9,6 +9,10 @@ spec:
     _Uses `buildah` to create a container image leveraging [trusted artifacts](https://konflux-ci.dev/architecture/ADR/0036-trusted-artifacts.html). It also optionally creates a source image and runs some build-time tests. Information is shared between tasks using OCI artifacts instead of PVCs. EC will pass the [`trusted_task.trusted`](https://conforma.dev/docs/policy/packages/release_trusted_task.html#trusted_task__trusted) policy as long as all data used to build the artifact is generated from trusted tasks.
     This pipeline is pushed as a Tekton bundle to [quay.io](https://quay.io/repository/konflux-ci/tekton-catalog/pipeline-docker-build-oci-ta?tab=tags)_
   params:
+    - name: enable-eg-orchestration
+      type: string
+      default: "false"
+      description: Set to true to enable ephemeral branch fork + operator-processor
     - description: Source Repository URL
       name: git-url
       type: string
@@ -141,6 +145,7 @@ spec:
         workspaces:
           - name: github-credentials
             description: Secret workspace holding a 'token' key with a GitHub API token
+            optional: true
         steps:
           - name: create-branch
             image: registry.access.redhat.com/ubi9/ubi-minimal:latest
@@ -191,6 +196,11 @@ spec:
       workspaces:
         - name: github-credentials
           workspace: github-credentials
+      when:
+        - input: $(params.enable-eg-orchestration)
+          operator: in
+          values:
+            - "true"
     - name: trigger-operator-processor
       params:
         - name: repo
@@ -215,6 +225,7 @@ spec:
         workspaces:
           - name: github-credentials
             description: Secret workspace holding a 'token' key with a GitHub API token
+            optional: true
         steps:
           - name: dispatch-and-wait
             image: registry.access.redhat.com/ubi9/ubi-minimal:latest
@@ -283,26 +294,53 @@ spec:
       workspaces:
         - name: github-credentials
           workspace: github-credentials
+      when:
+        - input: $(params.enable-eg-orchestration)
+          operator: in
+          values:
+            - "true"
     - name: get-latest-commit
       params:
+        - name: enable-eg-orchestration
+          value: $(params.enable-eg-orchestration)
         - name: repo
           value: $(params.operator-repo)
         - name: branch-name
           value: eg-$(params.leader-pr-number)
+        - name: git-url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.revision)
       runAfter:
         - trigger-operator-processor
       taskSpec:
+        description: |
+          Resolves the git-url and revision the build should use.
+
+          This task deliberately has no `when` guard: clone-repository consumes its
+          results, and in Tekton a task that references the results of a skipped
+          task is itself skipped.  Guarding this task would therefore skip the whole
+          build in direct mode.  It runs in both modes and branches internally.
         params:
+          - name: enable-eg-orchestration
+            type: string
           - name: repo
             type: string
           - name: branch-name
             type: string
+          - name: git-url
+            type: string
+          - name: revision
+            type: string
         results:
           - name: commit-sha
-            description: Latest commit SHA on ephemeral branch
+            description: Revision to build - ephemeral branch HEAD in EG mode, the caller's revision otherwise
+          - name: git-url
+            description: Repository to clone - operator-repo in EG mode, the caller's git-url otherwise
         workspaces:
           - name: github-credentials
-            description: Secret workspace holding a 'token' key with a GitHub API token
+            optional: true
+            description: Secret workspace holding a 'token' key. Only read in EG mode.
         steps:
           - name: get-sha
             image: registry.access.redhat.com/ubi9/ubi-minimal:latest
@@ -310,6 +348,16 @@ spec:
               #!/bin/bash
               set -euo pipefail
 
+              if [ "$(params.enable-eg-orchestration)" != "true" ]; then
+                # Direct mode: build exactly what the caller asked for.  No GitHub API
+                # call, no token required.
+                echo "EG orchestration disabled - building $(params.revision) from $(params.git-url)"
+                echo -n "$(params.revision)" > $(results.commit-sha.path)
+                echo -n "$(params.git-url)" > $(results.git-url.path)
+                exit 0
+              fi
+
+              # EG mode: operator-processor has pushed new commits, so re-read HEAD.
               TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
 
               SHA=$(curl -sS -H "Authorization: token ${TOKEN}" \
@@ -323,6 +371,7 @@ spec:
 
               echo "Ephemeral branch head is ${SHA}"
               echo -n "${SHA}" > $(results.commit-sha.path)
+              echo -n "https://github.com/$(params.repo).git" > $(results.git-url.path)
       workspaces:
         - name: github-credentials
           workspace: github-credentials
@@ -344,7 +393,7 @@ spec:
     - name: clone-repository
       params:
         - name: url
-          value: https://github.com/$(params.operator-repo).git
+          value: $(tasks.get-latest-commit.results.git-url)
         - name: revision
           value: $(tasks.get-latest-commit.results.commit-sha)
         - name: ociStorage
@@ -732,3 +781,4 @@ spec:
       optional: true
     - name: github-credentials
       description: Secret workspace with a "token" key holding a GitHub API token (see the github-token-secret param).
+      optional: true
