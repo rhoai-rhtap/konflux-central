@@ -88,6 +88,21 @@ spec:
       description: When "true", omit the build history (history timestamps, layer metadata, etc.) from the resulting image.
       name: omit-history
       type: string
+    - name: leader-pr-number
+      type: string
+      description: Leader PR number in gated-artifacts-promoter
+    - name: operator-repo
+      type: string
+      default: rhoai-rhtap/rhods-operator-gap
+      description: Operator repo to fork ephemeral branch from
+    - name: source-branch
+      type: string
+      default: stable
+      description: Branch to fork from (stable or main)
+    - name: github-token-secret
+      type: string
+      default: github-token
+      description: Secret name containing GitHub token for API calls
   results:
     - description: ""
       name: IMAGE_URL
@@ -102,6 +117,215 @@ spec:
       name: CHAINS-GIT_COMMIT
       value: $(tasks.clone-repository.results.commit)
   tasks:
+    - name: create-ephemeral-branch
+      params:
+        - name: repo
+          value: $(params.operator-repo)
+        - name: source-branch
+          value: $(params.source-branch)
+        - name: branch-name
+          value: eg-$(params.leader-pr-number)
+      taskSpec:
+        params:
+          - name: repo
+            type: string
+          - name: source-branch
+            type: string
+          - name: branch-name
+            type: string
+        results:
+          - name: branch-name
+            description: Name of the created ephemeral branch
+          - name: branch-sha
+            description: SHA of the branch head
+        workspaces:
+          - name: github-credentials
+            description: Secret workspace holding a 'token' key with a GitHub API token
+        steps:
+          - name: create-branch
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+            script: |
+              #!/bin/bash
+              set -euo pipefail
+
+              REPO="$(params.repo)"
+              SOURCE="$(params.source-branch)"
+              BRANCH="$(params.branch-name)"
+              TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
+
+              # Get source branch SHA.  The ref response carries a single "sha" key,
+              # inside .object.  Tolerate both compact and pretty-printed JSON.
+              SOURCE_SHA=$(curl -sS -H "Authorization: token ${TOKEN}" \
+                "https://api.github.com/repos/${REPO}/git/ref/heads/${SOURCE}" \
+                | grep -o '"sha"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+
+              if [ -z "${SOURCE_SHA}" ]; then
+                echo "Could not resolve head of ${SOURCE} in ${REPO}. Check the branch exists and the token has read access." >&2
+                exit 1
+              fi
+              echo "Source ${SOURCE} is at ${SOURCE_SHA}"
+
+              # Try to create the branch; if it already exists, force it to match.
+              HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+                -H "Authorization: token ${TOKEN}" \
+                -X POST "https://api.github.com/repos/${REPO}/git/refs" \
+                -d "{\"ref\":\"refs/heads/${BRANCH}\",\"sha\":\"${SOURCE_SHA}\"}")
+
+              if [ "${HTTP_CODE}" = "422" ]; then
+                echo "Branch ${BRANCH} already exists - resetting it to ${SOURCE_SHA}"
+                PATCH_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+                  -H "Authorization: token ${TOKEN}" \
+                  -X PATCH "https://api.github.com/repos/${REPO}/git/refs/heads/${BRANCH}" \
+                  -d "{\"sha\":\"${SOURCE_SHA}\",\"force\":true}")
+                if [ "${PATCH_CODE}" != "200" ]; then
+                  echo "Failed to reset ${BRANCH} (HTTP ${PATCH_CODE})" >&2
+                  exit 1
+                fi
+              elif [ "${HTTP_CODE}" != "201" ]; then
+                echo "Failed to create ${BRANCH} (HTTP ${HTTP_CODE})" >&2
+                exit 1
+              fi
+
+              echo -n "${BRANCH}" > $(results.branch-name.path)
+              echo -n "${SOURCE_SHA}" > $(results.branch-sha.path)
+      workspaces:
+        - name: github-credentials
+          workspace: github-credentials
+    - name: trigger-operator-processor
+      params:
+        - name: repo
+          value: $(params.operator-repo)
+        - name: branch-name
+          value: eg-$(params.leader-pr-number)
+        - name: leader-pr-number
+          value: $(params.leader-pr-number)
+      runAfter:
+        - create-ephemeral-branch
+      taskSpec:
+        params:
+          - name: repo
+            type: string
+          - name: branch-name
+            type: string
+          - name: leader-pr-number
+            type: string
+        results:
+          - name: status
+            description: success or failure
+        workspaces:
+          - name: github-credentials
+            description: Secret workspace holding a 'token' key with a GitHub API token
+        steps:
+          - name: dispatch-and-wait
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+            script: |
+              #!/bin/bash
+              set -euo pipefail
+
+              REPO="$(params.repo)"
+              BRANCH="$(params.branch-name)"
+              TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
+
+              RUNS_URL="https://api.github.com/repos/${REPO}/actions/runs?branch=${BRANCH}&event=workflow_dispatch&per_page=1"
+
+              latest_run_id() {
+                curl -sS -H "Authorization: token ${TOKEN}" "${RUNS_URL}" \
+                  | grep -o '"id"[[:space:]]*:[[:space:]]*[0-9]*' | head -1 | tr -cd '0-9' || true
+              }
+
+              # Record the newest pre-existing run so a previous run on this branch is
+              # never mistaken for ours - otherwise a stale success would pass the gate
+              # instantly without operator-processor having run at all.
+              PREV_ID=$(latest_run_id)
+              echo "Newest pre-existing workflow_dispatch run on ${BRANCH}: ${PREV_ID:-none}"
+
+              DISPATCH_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+                -H "Authorization: token ${TOKEN}" \
+                -X POST "https://api.github.com/repos/${REPO}/actions/workflows/operator-processor.yaml/dispatches" \
+                -d "{\"ref\":\"${BRANCH}\",\"inputs\":{\"eg-mode\":\"true\",\"eg-branch\":\"${BRANCH}\",\"leader-pr-number\":\"$(params.leader-pr-number)\"}}")
+
+              if [ "${DISPATCH_CODE}" != "204" ]; then
+                echo "workflow_dispatch was not accepted (HTTP ${DISPATCH_CODE})" >&2
+                echo -n "failure" > $(results.status.path)
+                exit 1
+              fi
+              echo "Dispatched operator-processor on ${BRANCH}"
+
+              # Wait for the new run to be registered.
+              sleep 10
+
+              # Poll for completion (max 20 min).
+              for i in $(seq 1 40); do
+                RESP=$(curl -sS -H "Authorization: token ${TOKEN}" "${RUNS_URL}")
+                RUN_ID=$(echo "${RESP}" | grep -o '"id"[[:space:]]*:[[:space:]]*[0-9]*' | head -1 | tr -cd '0-9' || true)
+
+                if [ -n "${RUN_ID}" ] && [ "${RUN_ID}" != "${PREV_ID}" ]; then
+                  # "conclusion" is null while in progress, so this stays empty until done.
+                  STATUS=$(echo "${RESP}" | grep -o '"conclusion"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+
+                  if [ "${STATUS}" = "success" ]; then
+                    echo -n "success" > $(results.status.path)
+                    exit 0
+                  elif [ -n "${STATUS}" ]; then
+                    echo "operator-processor run ${RUN_ID} concluded: ${STATUS}" >&2
+                    echo -n "failure" > $(results.status.path)
+                    exit 1
+                  fi
+                fi
+
+                echo "Waiting for operator-processor... attempt $i/40"
+                sleep 30
+              done
+
+              echo "Timed out after 20 minutes waiting for operator-processor" >&2
+              echo -n "timeout" > $(results.status.path)
+              exit 1
+      workspaces:
+        - name: github-credentials
+          workspace: github-credentials
+    - name: get-latest-commit
+      params:
+        - name: repo
+          value: $(params.operator-repo)
+        - name: branch-name
+          value: eg-$(params.leader-pr-number)
+      runAfter:
+        - trigger-operator-processor
+      taskSpec:
+        params:
+          - name: repo
+            type: string
+          - name: branch-name
+            type: string
+        results:
+          - name: commit-sha
+            description: Latest commit SHA on ephemeral branch
+        workspaces:
+          - name: github-credentials
+            description: Secret workspace holding a 'token' key with a GitHub API token
+        steps:
+          - name: get-sha
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+            script: |
+              #!/bin/bash
+              set -euo pipefail
+
+              TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
+
+              SHA=$(curl -sS -H "Authorization: token ${TOKEN}" \
+                "https://api.github.com/repos/$(params.repo)/git/ref/heads/$(params.branch-name)" \
+                | grep -o '"sha"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+
+              if [ -z "${SHA}" ]; then
+                echo "Could not resolve head of $(params.branch-name) in $(params.repo)" >&2
+                exit 1
+              fi
+
+              echo "Ephemeral branch head is ${SHA}"
+              echo -n "${SHA}" > $(results.commit-sha.path)
+      workspaces:
+        - name: github-credentials
+          workspace: github-credentials
     - name: init
       params:
         - name: enable-cache-proxy
@@ -115,12 +339,14 @@ spec:
           - name: kind
             value: task
         resolver: bundles
+      runAfter:
+        - get-latest-commit
     - name: clone-repository
       params:
         - name: url
-          value: $(params.git-url)
+          value: https://github.com/$(params.operator-repo).git
         - name: revision
-          value: $(params.revision)
+          value: $(tasks.get-latest-commit.results.commit-sha)
         - name: ociStorage
           value: $(params.output-image).git
         - name: ociArtifactExpiresAfter
@@ -504,3 +730,5 @@ spec:
       optional: true
     - name: netrc
       optional: true
+    - name: github-credentials
+      description: Secret workspace with a "token" key holding a GitHub API token (see the github-token-secret param).
