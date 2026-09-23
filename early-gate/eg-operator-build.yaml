@@ -112,7 +112,7 @@ spec:
       description: Secret name containing GitHub token for API calls
     - name: leader-pr-repo
       type: string
-      default: rhoai-rhtap/gated-artifacts-promoter
+      default: red-hat-data-services/gated-artifacts-promoter
       description: Repo where the leader PR lives
   results:
     - description: ""
