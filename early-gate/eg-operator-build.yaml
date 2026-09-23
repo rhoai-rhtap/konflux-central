@@ -436,20 +436,31 @@ spec:
           value: $(params.operator-repo)
         - name: branch-name
           value: eg-$(params.leader-pr-number)
+        - name: forked-from
+          value: $(tasks.check-leader-pr.results.source-branch)
         - name: git-url
           value: $(params.git-url)
         - name: revision
           value: $(params.revision)
+        - name: output-image
+          value: $(params.output-image)
       runAfter:
         - trigger-operator-processor
       taskSpec:
         description: |
-          Resolves the git-url and revision the build should use.
+          Resolves the git-url, revision and image tag the build should use.
 
           This task deliberately has no `when` guard: clone-repository consumes its
           results, and in Tekton a task that references the results of a skipped
           task is itself skipped.  Guarding this task would therefore skip the whole
           build in direct mode.  It runs in both modes and branches internally.
+
+          It is also the only place that can name the built image correctly.  The
+          caller's output-image is tagged with the PaC `{{revision}}` - the head of
+          the pull request that triggered the run - which is expanded before the
+          ephemeral branch exists and is therefore never the commit that gets built
+          in EG mode.  This task re-tags it with the revision it just resolved, so
+          the image tag and the provenance agree.
         params:
           - name: enable-eg-orchestration
             type: string
@@ -459,15 +470,32 @@ spec:
             type: string
           - name: branch-name
             type: string
+          - name: forked-from
+            type: string
           - name: git-url
             type: string
           - name: revision
+            type: string
+          - name: output-image
             type: string
         results:
           - name: commit-sha
             description: Revision to build - ephemeral branch HEAD in EG mode, the caller's revision otherwise
           - name: git-url
             description: Repository to clone - operator-repo in EG mode, the caller's git-url otherwise
+          - name: source-branch
+            description: Branch the revision was read from - the ephemeral branch in EG mode, the caller's revision otherwise
+          - name: source-branch-url
+            description: |
+              Link to that branch.  Valid while the build runs; the finally task
+              deletes the ephemeral branch afterwards, so use commit-url for a
+              permanent reference.
+          - name: commit-url
+            description: Permanent link to the exact commit that is being built
+          - name: image-ref
+            description: |
+              Image to build and push, re-tagged with the resolved revision.  Equal
+              to output-image in direct mode.
         workspaces:
           - name: github-credentials
             optional: true
@@ -479,12 +507,30 @@ spec:
               #!/bin/bash
               set -euo pipefail
 
+              OUTPUT_IMAGE="$(params.output-image)"
+
+              # Strip the tag off an image ref, leaving registry/namespace/repo.
+              # A colon is only a tag separator if nothing after it looks like a
+              # path - otherwise it is a registry port on an untagged ref.
+              image_repo() {
+                local ref="$1" last="${1##*:}"
+                if [ "${last}" = "${ref}" ] || [ "${last}" != "${last#*/}" ]; then
+                  printf '%s' "${ref}"
+                else
+                  printf '%s' "${ref%:*}"
+                fi
+              }
+
               if [ "$(params.enable-eg-orchestration)" != "true" ]; then
-                # Direct mode: build exactly what the caller asked for.  No GitHub API
-                # call, no token required.
+                # Direct mode: build exactly what the caller asked for, under the
+                # name they asked for.  No GitHub API call, no token required.
                 echo "EG orchestration disabled - building $(params.revision) from $(params.git-url)"
                 echo -n "$(params.revision)" > $(results.commit-sha.path)
                 echo -n "$(params.git-url)" > $(results.git-url.path)
+                echo -n "$(params.revision)" > $(results.source-branch.path)
+                echo -n "" > $(results.source-branch-url.path)
+                echo -n "" > $(results.commit-url.path)
+                echo -n "${OUTPUT_IMAGE}" > $(results.image-ref.path)
                 exit 0
               fi
 
@@ -495,6 +541,10 @@ spec:
                 echo "EG build skipped - passing the caller's revision through unused"
                 echo -n "$(params.revision)" > $(results.commit-sha.path)
                 echo -n "$(params.git-url)" > $(results.git-url.path)
+                echo -n "" > $(results.source-branch.path)
+                echo -n "" > $(results.source-branch-url.path)
+                echo -n "" > $(results.commit-url.path)
+                echo -n "${OUTPUT_IMAGE}" > $(results.image-ref.path)
                 exit 0
               fi
 
@@ -510,9 +560,29 @@ spec:
                 exit 1
               fi
 
-              echo "Ephemeral branch head is ${SHA}"
+              BRANCH_URL="https://github.com/$(params.repo)/tree/$(params.branch-name)"
+              COMMIT_URL="https://github.com/$(params.repo)/commit/${SHA}"
+              IMAGE_REF="$(image_repo "${OUTPUT_IMAGE}"):eg-${SHA}"
+
+              # Say plainly where the bits came from.  Without this the only commit
+              # visible in the logs is the PaC revision, which is a different commit
+              # in a different repo from the one actually being built.
+              echo "Building from:"
+              echo "  repo          $(params.repo)"
+              echo "  branch        $(params.branch-name)  (forked from $(params.forked-from))"
+              echo "  commit        ${SHA}"
+              echo "  branch url    ${BRANCH_URL}"
+              echo "  commit url    ${COMMIT_URL}"
+              echo "  image         ${IMAGE_REF}"
+              echo "The caller's output-image was ${OUTPUT_IMAGE}; its tag names the"
+              echo "pull request head, not this commit, so it has been re-tagged."
+
               echo -n "${SHA}" > $(results.commit-sha.path)
               echo -n "https://github.com/$(params.repo).git" > $(results.git-url.path)
+              echo -n "$(params.branch-name)" > $(results.source-branch.path)
+              echo -n "${BRANCH_URL}" > $(results.source-branch-url.path)
+              echo -n "${COMMIT_URL}" > $(results.commit-url.path)
+              echo -n "${IMAGE_REF}" > $(results.image-ref.path)
       workspaces:
         - name: github-credentials
           workspace: github-credentials
@@ -543,7 +613,7 @@ spec:
         - name: revision
           value: $(tasks.get-latest-commit.results.commit-sha)
         - name: ociStorage
-          value: $(params.output-image).git
+          value: $(tasks.get-latest-commit.results.image-ref).git
         - name: ociArtifactExpiresAfter
           value: $(params.image-expires-after)
       runAfter:
@@ -574,7 +644,7 @@ spec:
         - name: SOURCE_ARTIFACT
           value: $(tasks.clone-repository.results.SOURCE_ARTIFACT)
         - name: ociStorage
-          value: $(params.output-image).prefetch
+          value: $(tasks.get-latest-commit.results.image-ref).prefetch
         - name: ociArtifactExpiresAfter
           value: $(params.image-expires-after)
       runAfter:
@@ -601,7 +671,7 @@ spec:
     - name: build-container
       params:
         - name: IMAGE
-          value: $(params.output-image)
+          value: $(tasks.get-latest-commit.results.image-ref)
         - name: DOCKERFILE
           value: $(params.dockerfile)
         - name: CONTEXT
@@ -658,7 +728,7 @@ spec:
     - name: build-image-index
       params:
         - name: IMAGE
-          value: $(params.output-image)
+          value: $(tasks.get-latest-commit.results.image-ref)
         - name: ALWAYS_BUILD_INDEX
           value: $(params.build-image-index)
         - name: IMAGES
@@ -1021,7 +1091,9 @@ spec:
           itself skipped, so referencing build-image-index results here would make
           this task disappear in exactly the failure cases it exists to report.
           `$(tasks.<name>.status)` carries no such penalty - it resolves to None for
-          a skipped task - and output-image is known up front.
+          a skipped task - and output-image is known up front.  That is also why the
+          published image ref is recomputed here from the commit being tagged rather
+          than read from get-latest-commit.results.image-ref.
         params:
           - name: repo
             type: string
@@ -1151,12 +1223,36 @@ spec:
               **Build:** $(params.build-status) | **Pipeline:** $(params.pipeline-status)
               **PipelineRun:** $(params.pipelinerun-name)"
 
+              # Where the bits came from.  The branch is deleted a few lines up, so
+              # link the commit - that reference outlives the run - and give the
+              # branch by name only.
+              if [ -n "${TAGGED_COMMIT}" ]; then
+                BODY="${BODY}
+              **Built from:** \`$(params.branch-name)\` @ [\`${TAGGED_COMMIT:0:7}\`](https://github.com/${OP_REPO}/commit/${TAGGED_COMMIT})"
+              fi
+
               # Only advertise the image when one was actually built and pushed.
               # After a failed or skipped build the ref points at nothing, and
               # printing it invites someone to pull a tag that does not exist.
+              #
+              # The ref is recomputed rather than taken from get-latest-commit:
+              # image-url carries the caller's output-image, whose tag is the PaC
+              # {{revision}} and names the wrong commit, but reading the result
+              # would tie this finally task to a task that does not run on every
+              # failure path and so would skip the report entirely.  Derive it from
+              # the commit that was just tagged, which is the same commit the build
+              # used.
               if [ "$(params.build-status)" = "Succeeded" ]; then
+                IMAGE_URL="$(params.image-url)"
+                if [ -n "${TAGGED_COMMIT}" ]; then
+                  LAST="${IMAGE_URL##*:}"
+                  if [ "${LAST}" != "${IMAGE_URL}" ] && [ "${LAST}" = "${LAST#*/}" ]; then
+                    IMAGE_URL="${IMAGE_URL%:*}"
+                  fi
+                  IMAGE_URL="${IMAGE_URL}:eg-${TAGGED_COMMIT}"
+                fi
                 BODY="${BODY}
-              **Image:** $(params.image-url)"
+              **Image:** ${IMAGE_URL}"
               fi
 
               if [ -n "${TAG_NAME}" ]; then
