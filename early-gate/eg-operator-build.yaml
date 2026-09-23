@@ -1129,8 +1129,15 @@ spec:
 
               MARKER="<!-- eg-operator-build-status -->"
 
+              # build-status is `None` in two very different situations: the
+              # single-PR skip, where every build task is guarded off and the
+              # pipeline is green, and a cascade skip, where an upstream task
+              # failed and took build-image-index down with it.  Only the first
+              # is a skip; tell them apart on the pipeline status.
               if [ "$(params.build-status)" = "Succeeded" ]; then
                 HEADLINE=":white_check_mark: EG Operator Build - Passed"
+              elif [ "$(params.pipeline-status)" = "Failed" ]; then
+                HEADLINE=":x: EG Operator Build - Failed"
               elif [ "$(params.build-status)" = "None" ]; then
                 HEADLINE=":fast_forward: EG Operator Build - Skipped"
               else
@@ -1141,9 +1148,16 @@ spec:
               ## ${HEADLINE}
 
               **Repo:** ${OP_REPO}
-              **Image:** $(params.image-url)
               **Build:** $(params.build-status) | **Pipeline:** $(params.pipeline-status)
               **PipelineRun:** $(params.pipelinerun-name)"
+
+              # Only advertise the image when one was actually built and pushed.
+              # After a failed or skipped build the ref points at nothing, and
+              # printing it invites someone to pull a tag that does not exist.
+              if [ "$(params.build-status)" = "Succeeded" ]; then
+                BODY="${BODY}
+              **Image:** $(params.image-url)"
+              fi
 
               if [ -n "${TAG_NAME}" ]; then
                 BODY="${BODY}
