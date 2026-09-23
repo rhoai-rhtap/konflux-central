@@ -102,11 +102,18 @@ spec:
     - name: source-branch
       type: string
       default: stable
-      description: Branch to fork from (stable or main)
+      description: |
+        Fallback branch to fork from.  In EG mode check-leader-pr normally decides
+        this (main when the leader PR carries an operator PR, stable otherwise);
+        this value is used when orchestration is off or the leader PR cannot be read.
     - name: github-token-secret
       type: string
       default: github-token
       description: Secret name containing GitHub token for API calls
+    - name: leader-pr-repo
+      type: string
+      default: rhoai-rhtap/gated-artifacts-promoter
+      description: Repo where the leader PR lives
   results:
     - description: ""
       name: IMAGE_URL
@@ -121,14 +128,126 @@ spec:
       name: CHAINS-GIT_COMMIT
       value: $(tasks.clone-repository.results.commit)
   tasks:
+    - name: check-leader-pr
+      params:
+        - name: enable-eg-orchestration
+          value: $(params.enable-eg-orchestration)
+        - name: leader-pr-repo
+          value: $(params.leader-pr-repo)
+        - name: leader-pr-number
+          value: $(params.leader-pr-number)
+        - name: operator-repo-name
+          value: $(params.operator-repo)
+        - name: fallback-source-branch
+          value: $(params.source-branch)
+      taskSpec:
+        description: |
+          Reads the leader PR to decide what the EG build should do.
+
+          Like get-latest-commit, this task deliberately has no `when` guard.  Every
+          build task consumes its skip-eg-build result, and in Tekton a task that
+          references the results of a skipped task is itself skipped - guarding this
+          task on enable-eg-orchestration would therefore skip the entire build in
+          direct mode.  It runs in both modes and branches internally.
+        params:
+          - name: enable-eg-orchestration
+            type: string
+          - name: leader-pr-repo
+            type: string
+          - name: leader-pr-number
+            type: string
+          - name: operator-repo-name
+            type: string
+          - name: fallback-source-branch
+            type: string
+        results:
+          - name: source-branch
+            description: Branch to fork the ephemeral branch from - main or stable
+          - name: skip-eg-build
+            description: true when the leader PR carries only the operator PR, so the Task 1 PR build can be reused
+        workspaces:
+          - name: github-credentials
+            optional: true
+            description: Secret workspace holding a 'token' key. Only read in EG mode.
+        steps:
+          - name: check-pr
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+            script: |
+              #!/bin/bash
+              set -euo pipefail
+
+              # Direct mode: nothing to look up, honour what the caller asked for.
+              if [ "$(params.enable-eg-orchestration)" != "true" ]; then
+                echo "EG orchestration disabled - forking from $(params.fallback-source-branch), not skipping"
+                echo -n "$(params.fallback-source-branch)" > $(results.source-branch.path)
+                echo -n "false" > $(results.skip-eg-build.path)
+                exit 0
+              fi
+
+              # jq, rather than grep, because a PR body is free text: it contains
+              # escaped quotes and \n, which shear a grep/cut pipeline off at the
+              # first one and silently truncate the body we are about to search.
+              microdnf install -y jq >/dev/null
+
+              TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
+              REPO="$(params.leader-pr-repo)"
+              PR_NUM="$(params.leader-pr-number)"
+              OP_REPO="$(params.operator-repo-name)"
+
+              HTTP_CODE=$(curl -sS -o /tmp/pr.json -w "%{http_code}" \
+                -H "Authorization: token ${TOKEN}" \
+                "https://api.github.com/repos/${REPO}/pulls/${PR_NUM}")
+
+              # Degrade rather than fail.  A leader PR that cannot be read must not
+              # take the build down with it - fall back to the caller's branch and
+              # build, which is the current pre-check-leader-pr behaviour.
+              if [ "${HTTP_CODE}" != "200" ]; then
+                echo "Could not read leader PR ${REPO}#${PR_NUM} (HTTP ${HTTP_CODE})" >&2
+                echo "Falling back to $(params.fallback-source-branch), not skipping" >&2
+                echo -n "$(params.fallback-source-branch)" > $(results.source-branch.path)
+                echo -n "false" > $(results.skip-eg-build.path)
+                exit 0
+              fi
+
+              PR_BODY=$(jq -r '.body // ""' /tmp/pr.json)
+
+              # Every repo the leader PR references, deduplicated.  grep -c would
+              # count matching *lines*, and the body is frequently one line, so it
+              # would report 1 no matter how many repos were listed.
+              LISTED=$(printf '%s' "${PR_BODY}" \
+                | grep -oiE 'rhoai-rhtap/[A-Za-z0-9._-]+' | tr 'A-Z' 'a-z' | sort -u || true)
+              PR_COUNT=$(printf '%s' "${LISTED}" | grep -c . || true)
+              echo "Leader PR references ${PR_COUNT} repo(s):"
+              printf '%s\n' "${LISTED}"
+
+              if printf '%s' "${LISTED}" | grep -qixF "${OP_REPO}"; then
+                echo "Operator PR present - forking from main"
+                echo -n "main" > $(results.source-branch.path)
+
+                if [ "${PR_COUNT}" -le 1 ]; then
+                  echo "Operator PR is the only PR - skipping EG build, Task 1 image is reusable"
+                  echo -n "true" > $(results.skip-eg-build.path)
+                else
+                  echo -n "false" > $(results.skip-eg-build.path)
+                fi
+              else
+                echo "No operator PR - forking from stable"
+                echo -n "stable" > $(results.source-branch.path)
+                echo -n "false" > $(results.skip-eg-build.path)
+              fi
+      workspaces:
+        - name: github-credentials
+          workspace: github-credentials
     - name: create-ephemeral-branch
       params:
         - name: repo
           value: $(params.operator-repo)
         - name: source-branch
-          value: $(params.source-branch)
+          value: $(tasks.check-leader-pr.results.source-branch)
         - name: branch-name
           value: eg-$(params.leader-pr-number)
+      runAfter:
+        - check-leader-pr
       taskSpec:
         params:
           - name: repo
@@ -197,6 +316,10 @@ spec:
         - name: github-credentials
           workspace: github-credentials
       when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
         - input: $(params.enable-eg-orchestration)
           operator: in
           values:
@@ -295,6 +418,10 @@ spec:
         - name: github-credentials
           workspace: github-credentials
       when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
         - input: $(params.enable-eg-orchestration)
           operator: in
           values:
@@ -303,6 +430,8 @@ spec:
       params:
         - name: enable-eg-orchestration
           value: $(params.enable-eg-orchestration)
+        - name: skip-eg-build
+          value: $(tasks.check-leader-pr.results.skip-eg-build)
         - name: repo
           value: $(params.operator-repo)
         - name: branch-name
@@ -323,6 +452,8 @@ spec:
           build in direct mode.  It runs in both modes and branches internally.
         params:
           - name: enable-eg-orchestration
+            type: string
+          - name: skip-eg-build
             type: string
           - name: repo
             type: string
@@ -352,6 +483,16 @@ spec:
                 # Direct mode: build exactly what the caller asked for.  No GitHub API
                 # call, no token required.
                 echo "EG orchestration disabled - building $(params.revision) from $(params.git-url)"
+                echo -n "$(params.revision)" > $(results.commit-sha.path)
+                echo -n "$(params.git-url)" > $(results.git-url.path)
+                exit 0
+              fi
+
+              # Single-PR skip: no ephemeral branch was created, so there is no HEAD
+              # to resolve.  Everything downstream is skipped by the same result, so
+              # these values go unused - they exist only so this task does not fail.
+              if [ "$(params.skip-eg-build)" = "true" ]; then
+                echo "EG build skipped - passing the caller's revision through unused"
                 echo -n "$(params.revision)" > $(results.commit-sha.path)
                 echo -n "$(params.git-url)" > $(results.git-url.path)
                 exit 0
@@ -390,6 +531,11 @@ spec:
         resolver: bundles
       runAfter:
         - get-latest-commit
+      when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
     - name: clone-repository
       params:
         - name: url
@@ -414,6 +560,11 @@ spec:
       workspaces:
         - name: basic-auth
           workspace: git-auth
+      when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
     - name: prefetch-dependencies
       params:
         - name: input
@@ -442,6 +593,11 @@ spec:
           workspace: git-auth
         - name: netrc
           workspace: netrc
+      when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
     - name: build-container
       params:
         - name: IMAGE
@@ -494,6 +650,11 @@ spec:
           - name: kind
             value: task
         resolver: bundles
+      when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
     - name: build-image-index
       params:
         - name: IMAGE
@@ -516,6 +677,11 @@ spec:
           - name: kind
             value: task
         resolver: bundles
+      when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
     - name: build-source-image
       params:
         - name: BINARY_IMAGE
@@ -538,6 +704,10 @@ spec:
             value: task
         resolver: bundles
       when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
         - input: $(params.build-source-image)
           operator: in
           values:
@@ -560,6 +730,10 @@ spec:
             value: task
         resolver: bundles
       when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
         - input: $(params.skip-checks)
           operator: in
           values:
@@ -582,6 +756,10 @@ spec:
             value: task
         resolver: bundles
       when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
         - input: $(params.skip-checks)
           operator: in
           values:
@@ -602,6 +780,10 @@ spec:
             value: task
         resolver: bundles
       when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
         - input: $(params.skip-checks)
           operator: in
           values:
@@ -630,6 +812,10 @@ spec:
             value: task
         resolver: bundles
       when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
         - input: $(params.skip-checks)
           operator: in
           values:
@@ -652,6 +838,10 @@ spec:
             value: task
         resolver: bundles
       when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
         - input: $(params.skip-checks)
           operator: in
           values:
@@ -680,6 +870,10 @@ spec:
             value: task
         resolver: bundles
       when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
         - input: $(params.skip-checks)
           operator: in
           values:
@@ -708,6 +902,10 @@ spec:
             value: task
         resolver: bundles
       when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
         - input: $(params.skip-checks)
           operator: in
           values:
@@ -729,6 +927,11 @@ spec:
           - name: kind
             value: task
         resolver: bundles
+      when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
     - name: push-dockerfile
       params:
         - name: IMAGE
@@ -752,6 +955,11 @@ spec:
           - name: kind
             value: task
         resolver: bundles
+      when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
     - name: rpms-signature-scan
       params:
         - name: image-url
@@ -770,10 +978,237 @@ spec:
             value: task
         resolver: bundles
       when:
+        - input: $(tasks.check-leader-pr.results.skip-eg-build)
+          operator: notin
+          values:
+            - "true"
         - input: $(params.skip-checks)
           operator: in
           values:
             - "false"
+  finally:
+    # Tag + cleanup and the leader-PR report are one task, not two, because Tekton
+    # runs finally tasks in parallel with no ordering control and forbids one finally
+    # task from consuming another's results.  Split in two, the reporter would race
+    # the cleanup for the ephemeral branch HEAD - and lose it outright once the
+    # branch is deleted, leaving it unable to name the tag it is meant to link.  As
+    # steps they are ordered, and the tag name passes between them as a result.
+    - name: tag-cleanup-and-report
+      params:
+        - name: repo
+          value: $(params.operator-repo)
+        - name: branch-name
+          value: eg-$(params.leader-pr-number)
+        - name: leader-pr-repo
+          value: $(params.leader-pr-repo)
+        - name: leader-pr-number
+          value: $(params.leader-pr-number)
+        - name: image-url
+          value: $(params.output-image)
+        - name: build-status
+          value: $(tasks.build-image-index.status)
+        - name: pipeline-status
+          value: $(tasks.status)
+        - name: pipelinerun-name
+          value: $(context.pipelineRun.name)
+      taskSpec:
+        description: |
+          Preserves the ephemeral branch HEAD as a tag, deletes the branch, then
+          posts the outcome to the leader PR.
+
+          Params are deliberately read from `params` and `.status` only.  A finally
+          task that consumes a *result* of a task that failed or was skipped is
+          itself skipped, so referencing build-image-index results here would make
+          this task disappear in exactly the failure cases it exists to report.
+          `$(tasks.<name>.status)` carries no such penalty - it resolves to None for
+          a skipped task - and output-image is known up front.
+        params:
+          - name: repo
+            type: string
+          - name: branch-name
+            type: string
+          - name: leader-pr-repo
+            type: string
+          - name: leader-pr-number
+            type: string
+          - name: image-url
+            type: string
+          - name: build-status
+            type: string
+          - name: pipeline-status
+            type: string
+          - name: pipelinerun-name
+            type: string
+        results:
+          - name: tag-name
+            description: Tag created from the ephemeral branch HEAD, empty if none was created
+          - name: tagged-commit
+            description: Commit the tag points at, empty if the branch was already gone
+        workspaces:
+          - name: github-credentials
+            optional: true
+            description: Secret workspace holding a 'token' key with a GitHub API token
+        steps:
+          - name: tag-and-cleanup
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+            script: |
+              #!/bin/bash
+              # No `set -e`: this step must never abort the task, or the report step
+              # below it never runs.  Both results are always written, empty if the
+              # branch had already gone.
+              set -uo pipefail
+
+              TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
+              REPO="$(params.repo)"
+              BRANCH="$(params.branch-name)"
+
+              : > $(results.tag-name.path)
+              : > $(results.tagged-commit.path)
+
+              HEAD_SHA=$(curl -sS -H "Authorization: token ${TOKEN}" \
+                "https://api.github.com/repos/${REPO}/git/ref/heads/${BRANCH}" \
+                | grep -o '"sha"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+
+              if [ -z "${HEAD_SHA}" ]; then
+                echo "Branch ${BRANCH} not found - never created, or already cleaned up"
+                exit 0
+              fi
+
+              SHORT_SHA="${HEAD_SHA:0:7}"
+              TAG_NAME="eg-build-$(params.leader-pr-number)-${SHORT_SHA}"
+
+              echo "Creating tag ${TAG_NAME} at ${HEAD_SHA}"
+              HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+                -H "Authorization: token ${TOKEN}" \
+                -X POST "https://api.github.com/repos/${REPO}/git/refs" \
+                -d "{\"ref\":\"refs/tags/${TAG_NAME}\",\"sha\":\"${HEAD_SHA}\"}")
+
+              if [ "${HTTP_CODE}" = "201" ]; then
+                echo "Tag created: ${TAG_NAME}"
+              elif [ "${HTTP_CODE}" = "422" ]; then
+                echo "Tag ${TAG_NAME} already exists - same commit, nothing to do"
+              else
+                echo "Tag creation returned HTTP ${HTTP_CODE}" >&2
+                # The branch is deliberately left in place: without a tag it is the
+                # only remaining handle on the commit.
+                exit 0
+              fi
+
+              echo -n "${TAG_NAME}" > $(results.tag-name.path)
+              echo -n "${HEAD_SHA}" > $(results.tagged-commit.path)
+
+              echo "Deleting branch ${BRANCH}"
+              DEL_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+                -H "Authorization: token ${TOKEN}" \
+                -X DELETE "https://api.github.com/repos/${REPO}/git/refs/heads/${BRANCH}")
+
+              if [ "${DEL_CODE}" = "204" ]; then
+                echo "Branch ${BRANCH} deleted"
+              else
+                echo "Branch deletion returned HTTP ${DEL_CODE} - may already be gone" >&2
+              fi
+
+              echo "Cleanup complete. Tag: ${TAG_NAME}, Commit: ${HEAD_SHA}"
+          - name: post-status
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+            script: |
+              #!/bin/bash
+              set -euo pipefail
+
+              # jq builds the request body.  Hand-rolled "{\"body\":\"...\"}" breaks on
+              # any quote or newline in the message, and is also what makes the
+              # comment lookup below correct rather than "first id in the payload".
+              microdnf install -y jq >/dev/null
+
+              TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
+              REPO="$(params.leader-pr-repo)"
+              PR_NUM="$(params.leader-pr-number)"
+              OP_REPO="$(params.repo)"
+              TAG_NAME=$(cat $(results.tag-name.path))
+              TAGGED_COMMIT=$(cat $(results.tagged-commit.path))
+
+              MARKER="<!-- eg-operator-build-status -->"
+
+              if [ "$(params.build-status)" = "Succeeded" ]; then
+                HEADLINE=":white_check_mark: EG Operator Build - Passed"
+              elif [ "$(params.build-status)" = "None" ]; then
+                HEADLINE=":fast_forward: EG Operator Build - Skipped"
+              else
+                HEADLINE=":x: EG Operator Build - Failed"
+              fi
+
+              BODY="${MARKER}
+              ## ${HEADLINE}
+
+              **Repo:** ${OP_REPO}
+              **Image:** $(params.image-url)
+              **Build:** $(params.build-status) | **Pipeline:** $(params.pipeline-status)
+              **PipelineRun:** $(params.pipelinerun-name)"
+
+              if [ -n "${TAG_NAME}" ]; then
+                BODY="${BODY}
+              **Tag:** [${TAG_NAME}](https://github.com/${OP_REPO}/tree/${TAG_NAME}) (\`${TAGGED_COMMIT}\`)"
+              else
+                BODY="${BODY}
+              **Tag:** none - no ephemeral branch to preserve"
+              fi
+
+              # Find a previous status comment by marker.  Paginate: the marker may
+              # well be on an older page of a busy leader PR, and missing it would
+              # post a duplicate instead of updating.
+              EXISTING=""
+              for page in $(seq 1 10); do
+                HTTP_CODE=$(curl -sS -o /tmp/comments.json -w "%{http_code}" \
+                  -H "Authorization: token ${TOKEN}" \
+                  "https://api.github.com/repos/${REPO}/issues/${PR_NUM}/comments?per_page=100&page=${page}")
+
+                # Degrade rather than fail.  A finally task that exits non-zero fails
+                # the whole PipelineRun, so an unreachable leader PR must not turn a
+                # green build red - and leader-pr-number is a placeholder today.
+                if [ "${HTTP_CODE}" != "200" ]; then
+                  echo "Cannot read comments on ${REPO}#${PR_NUM} (HTTP ${HTTP_CODE}) - skipping status report" >&2
+                  echo "${BODY}"
+                  exit 0
+                fi
+
+                COUNT=$(jq 'length' /tmp/comments.json)
+                FOUND=$(jq -r --arg m "${MARKER}" \
+                  '[.[] | select((.body // "") | contains($m))] | last | .id // empty' /tmp/comments.json)
+                [ -n "${FOUND}" ] && EXISTING="${FOUND}"
+                [ "${COUNT}" -lt 100 ] && break
+              done
+
+              jq -n --arg body "${BODY}" '{body: $body}' > /tmp/payload.json
+
+              if [ -n "${EXISTING}" ]; then
+                HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+                  -H "Authorization: token ${TOKEN}" \
+                  -X PATCH "https://api.github.com/repos/${REPO}/issues/comments/${EXISTING}" \
+                  --data-binary @/tmp/payload.json)
+                echo "Updated existing comment ${EXISTING} (HTTP ${HTTP_CODE})"
+              else
+                HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+                  -H "Authorization: token ${TOKEN}" \
+                  -X POST "https://api.github.com/repos/${REPO}/issues/${PR_NUM}/comments" \
+                  --data-binary @/tmp/payload.json)
+                echo "Created new status comment (HTTP ${HTTP_CODE})"
+              fi
+
+              # The read succeeded, so a failed write is a real problem - most likely
+              # the token lacks pull-requests:write on the leader PR repo.  Surface it
+              # rather than reporting a status that was never posted.
+              case "${HTTP_CODE}" in
+                200|201) ;;
+                *) echo "Status comment was not accepted (HTTP ${HTTP_CODE})" >&2; exit 1 ;;
+              esac
+      workspaces:
+        - name: github-credentials
+          workspace: github-credentials
+      when:
+        - input: $(params.enable-eg-orchestration)
+          operator: in
+          values:
+            - "true"
   workspaces:
     - name: git-auth
       optional: true
