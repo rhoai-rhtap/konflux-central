@@ -165,6 +165,11 @@ spec:
             description: Branch to fork the ephemeral branch from - main or stable
           - name: skip-eg-build
             description: true when the leader PR carries only the operator PR, so the Task 1 PR build can be reused
+          - name: operator-pr-included
+            description: |
+              true when the leader PR lists a child PR against the operator repo.
+              This is what decides main vs stable, so it is emitted separately for
+              downstream tasks to report the reason rather than just the outcome.
         workspaces:
           - name: github-credentials
             optional: true
@@ -176,11 +181,28 @@ spec:
               #!/bin/bash
               set -euo pipefail
 
+              # One place that prints the decision, so every exit path - including
+              # the degraded ones - says out loud which branch was chosen and why.
+              # Without this the only clue in the logs is a branch name, and "eg-5
+              # forked from stable" does not tell you whether stable was chosen or
+              # merely fallen back to.
+              summarise() {
+                echo "----------------------------------------------------------"
+                echo " Leader PR         $(params.leader-pr-repo)#$(params.leader-pr-number)"
+                echo " Operator PR       $1"
+                echo " Fork source       $2"
+                echo " EG build          $3"
+                echo " Reason            $4"
+                echo "----------------------------------------------------------"
+              }
+
               # Direct mode: nothing to look up, honour what the caller asked for.
               if [ "$(params.enable-eg-orchestration)" != "true" ]; then
-                echo "EG orchestration disabled - forking from $(params.fallback-source-branch), not skipping"
+                summarise "not checked" "$(params.fallback-source-branch)" "will run" \
+                  "EG orchestration is disabled - the caller's branch is used as-is"
                 echo -n "$(params.fallback-source-branch)" > $(results.source-branch.path)
                 echo -n "false" > $(results.skip-eg-build.path)
+                echo -n "false" > $(results.operator-pr-included.path)
                 exit 0
               fi
 
@@ -203,9 +225,11 @@ spec:
               # build, which is the current pre-check-leader-pr behaviour.
               if [ "${HTTP_CODE}" != "200" ]; then
                 echo "Could not read leader PR ${REPO}#${PR_NUM} (HTTP ${HTTP_CODE})" >&2
-                echo "Falling back to $(params.fallback-source-branch), not skipping" >&2
+                summarise "unknown" "$(params.fallback-source-branch)" "will run" \
+                  "leader PR could not be read (HTTP ${HTTP_CODE}) - fell back to the caller's branch"
                 echo -n "$(params.fallback-source-branch)" > $(results.source-branch.path)
                 echo -n "false" > $(results.skip-eg-build.path)
+                echo -n "false" > $(results.operator-pr-included.path)
                 exit 0
               fi
 
@@ -221,19 +245,27 @@ spec:
               printf '%s\n' "${LISTED}"
 
               if printf '%s' "${LISTED}" | grep -qixF "${OP_REPO}"; then
-                echo "Operator PR present - forking from main"
-                echo -n "main" > $(results.source-branch.path)
-
+                # The operator itself is changing, so the ephemeral branch has to
+                # carry that change: fork from main, where the operator PR lands.
                 if [ "${PR_COUNT}" -le 1 ]; then
-                  echo "Operator PR is the only PR - skipping EG build, Task 1 image is reusable"
+                  summarise "included" "main" "skipped" \
+                    "the operator is the only component in this leader PR, so the image its own PR build already produced is reusable"
                   echo -n "true" > $(results.skip-eg-build.path)
                 else
+                  summarise "included" "main" "will run" \
+                    "the leader PR changes the operator plus $((PR_COUNT - 1)) other component(s), so the operator must be rebuilt against them"
                   echo -n "false" > $(results.skip-eg-build.path)
                 fi
+                echo -n "main" > $(results.source-branch.path)
+                echo -n "true" > $(results.operator-pr-included.path)
               else
-                echo "No operator PR - forking from stable"
+                # No operator change in flight, so the operator source is whatever
+                # is already released: fork from stable.
+                summarise "not included" "stable" "will run" \
+                  "the leader PR changes ${PR_COUNT} component(s) but not the operator, so the operator is rebuilt from stable against them"
                 echo -n "stable" > $(results.source-branch.path)
                 echo -n "false" > $(results.skip-eg-build.path)
+                echo -n "false" > $(results.operator-pr-included.path)
               fi
       workspaces:
         - name: github-credentials
@@ -438,6 +470,8 @@ spec:
           value: eg-$(params.leader-pr-number)
         - name: forked-from
           value: $(tasks.check-leader-pr.results.source-branch)
+        - name: operator-pr-included
+          value: $(tasks.check-leader-pr.results.operator-pr-included)
         - name: git-url
           value: $(params.git-url)
         - name: revision
@@ -471,6 +505,8 @@ spec:
           - name: branch-name
             type: string
           - name: forked-from
+            type: string
+          - name: operator-pr-included
             type: string
           - name: git-url
             type: string
@@ -567,9 +603,16 @@ spec:
               # Say plainly where the bits came from.  Without this the only commit
               # visible in the logs is the PaC revision, which is a different commit
               # in a different repo from the one actually being built.
+              if [ "$(params.operator-pr-included)" = "true" ]; then
+                WHY="the leader PR includes an operator PR"
+              else
+                WHY="the leader PR includes no operator PR"
+              fi
+
               echo "Building from:"
               echo "  repo          $(params.repo)"
-              echo "  branch        $(params.branch-name)  (forked from $(params.forked-from))"
+              echo "  branch        $(params.branch-name)"
+              echo "  forked from   $(params.forked-from)  (${WHY})"
               echo "  commit        ${SHA}"
               echo "  branch url    ${BRANCH_URL}"
               echo "  commit url    ${COMMIT_URL}"
