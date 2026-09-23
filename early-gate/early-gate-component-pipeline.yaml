@@ -1,0 +1,677 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: early-gate-component-pipeline
+spec:
+  description: |
+    Early-gate orchestration pipeline for the RHOAI operator.
+
+    Structured after opendatahub-io/odh-konflux-central's early-gate-component-pipeline,
+    but with Block 1 inverted.  Upstream builds the operator inline - clone,
+    prefetch, buildah, apply-tags - inside this pipeline.  Here the container
+    build lives in its own PaC-triggered PipelineRun
+    (early-gate/rhods-operator-gap-eg-push.yaml, which is deployed to the
+    operator repo's .tekton/ directory), and this pipeline's job is to
+    construct the branch that build runs against and then watch it.
+
+    The sequence is:
+
+      check-leader-pr        read the leader PR, decide main vs stable
+      fork-operator-branch   always create eg-<leader-pr-number>
+      trigger-operator-...   dispatch operator-processor, return the run id
+      monitor-operator-...   wait for it, read back the commit it pushed
+      monitor-operator-build wait for the PaC build that commit triggered
+
+    Nothing is ever pushed to main or stable.  Every write goes to the
+    ephemeral branch, which the finally task deletes once the image carries a
+    durable tag.
+
+    Block 2 (bundle) and Block 3 (FBC) are intentionally out of scope for now.
+
+  params:
+  # --- General ---
+  - name: expected-cluster
+    type: string
+    default: ""
+    description: The cluster this pipeline is expected to run on
+  - name: pipeline-type
+    type: string
+    default: "pull-request"
+    description: Type of pipeline execution (push or pull-request)
+
+  # --- Leader PR ---
+  - name: leader-pr-repo
+    type: string
+    description: org/repo of the promoter repository holding the leader PR
+  - name: leader-pr-number
+    type: string
+    description: Leader PR number; the ephemeral branch is named eg-<this>
+  - name: operator-repo
+    type: string
+    default: "rhoai-rhtap/rhods-operator-gap"
+    description: org/repo of the operator repository to fork and build
+
+  # --- Operator build ---
+  - name: operator-output-image
+    type: string
+    default: "quay.io/redhat-user-workloads/rhoai-tenant/rhods-operator-gap"
+    description: |
+      Image repository, without a tag.  The EG build tags by commit, so the
+      tag is derived from what operator-processor actually pushed rather
+      than being passed in.
+  - name: fallback-source-branch
+    type: string
+    default: "stable"
+    description: Branch to fork from when the leader PR cannot be read
+  - name: build-check-name
+    type: string
+    default: "rhods-operator-gap-eg-on-push"
+    description: |
+      Name of the PaC check-run to watch.  Must match the PipelineRun name in
+      rhods-operator-gap-eg-push.yaml, since that is what PaC reports as.
+
+  # --- Timeouts ---
+  - name: processor-timeout-minutes
+    type: string
+    default: "20"
+  - name: build-timeout-minutes
+    type: string
+    default: "90"
+
+  results:
+  - name: EG_BRANCH
+    value: $(tasks.fork-operator-branch.results.branch-name)
+  - name: OPERATOR_COMMIT
+    value: $(tasks.monitor-operator-processor.results.processor-commit)
+  - name: OPERATOR_IMAGE_URL
+    value: $(tasks.monitor-operator-build.results.image-ref)
+  - name: BUILD_STATUS
+    value: $(tasks.monitor-operator-build.results.build-status)
+
+  workspaces:
+  - name: github-credentials
+    description: Secret workspace holding a 'token' key with a GitHub API token
+
+  tasks:
+
+  # --------------------------------------------------------------------------
+  # Init block (runs once for the entire pipeline)
+  # --------------------------------------------------------------------------
+
+  - name: rhoai-init
+    params:
+    - name: expected-cluster
+      value: $(params.expected-cluster)
+    - name: pipeline-type
+      value: $(params.pipeline-type)
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/red-hat-data-services/rhoai-konflux-tasks.git
+      - name: revision
+        value: odh
+      - name: pathInRepo
+        value: konflux-tekton-tasks/rhoai-init/0.3/rhoai-init.yaml
+
+  # Kept for parity with the upstream structure.  Its `build` result is not
+  # consumed here, because the container build no longer runs in this pipeline
+  # - it runs in the PaC-triggered PipelineRun that monitor-operator-build
+  # watches, and that run does its own init.
+  - name: init
+    runAfter:
+    - rhoai-init
+    params:
+    - name: image-url
+      value: $(params.operator-output-image)
+    - name: rebuild
+      value: "true"
+    - name: skip-checks
+      value: "true"
+    taskRef:
+      params:
+      - name: name
+        value: init
+      - name: bundle
+        value: quay.io/konflux-ci/tekton-catalog/task-init:0.2@sha256:b349d24cb896573695802d6913d311640b44675ec082b3ad167721946a6a0a71
+      - name: kind
+        value: task
+      resolver: bundles
+
+  # --------------------------------------------------------------------------
+  # Block 1: Operator build (orchestrated, not performed here)
+  # --------------------------------------------------------------------------
+
+  - name: check-leader-pr
+    runAfter:
+    - init
+    params:
+    - name: leader-pr-repo
+      value: $(params.leader-pr-repo)
+    - name: leader-pr-number
+      value: $(params.leader-pr-number)
+    - name: operator-repo-name
+      value: $(params.operator-repo)
+    - name: fallback-source-branch
+      value: $(params.fallback-source-branch)
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    taskSpec:
+      description: |
+        Reads the leader PR and decides which branch the ephemeral branch is
+        forked from.  An operator PR in the leader means the operator source
+        itself is changing, so fork from main, where that PR lands; otherwise
+        the operator source is whatever is released, so fork from stable.
+      params:
+      - name: leader-pr-repo
+        type: string
+      - name: leader-pr-number
+        type: string
+      - name: operator-repo-name
+        type: string
+      - name: fallback-source-branch
+        type: string
+      results:
+      - name: source-branch
+        description: Branch to fork the ephemeral branch from - main or stable
+      - name: operator-pr-included
+        description: true when the leader PR lists a child PR against the operator repo
+      - name: component-count
+        description: Number of distinct repos the leader PR references
+      workspaces:
+      - name: github-credentials
+        description: Secret workspace holding a 'token' key
+      steps:
+      - name: check-pr
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          # One place that prints the decision, so every exit path - including
+          # the degraded ones - says out loud which branch was chosen and why.
+          # Without this the only clue in the logs is a branch name, and "eg-5
+          # forked from stable" does not tell you whether stable was chosen or
+          # merely fallen back to.
+          summarise() {
+            echo "----------------------------------------------------------"
+            echo " Leader PR         $(params.leader-pr-repo)#$(params.leader-pr-number)"
+            echo " Operator PR       $1"
+            echo " Fork source       $2"
+            echo " Reason            $3"
+            echo "----------------------------------------------------------"
+          }
+
+          # jq, rather than grep, because a PR body is free text: it contains
+          # escaped quotes and \n, which shear a grep/cut pipeline off at the
+          # first one and silently truncate the body we are about to search.
+          microdnf install -y jq >/dev/null
+
+          TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
+          REPO="$(params.leader-pr-repo)"
+          PR_NUM="$(params.leader-pr-number)"
+          OP_REPO="$(params.operator-repo-name)"
+
+          HTTP_CODE=$(curl -sS -o /tmp/pr.json -w "%{http_code}" \
+            -H "Authorization: token ${TOKEN}" \
+            "https://api.github.com/repos/${REPO}/pulls/${PR_NUM}")
+
+          # Degrade rather than fail.  A leader PR that cannot be read must not
+          # take the run down with it - fall back to the caller's branch, which
+          # still produces a valid, if less targeted, build.
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "Could not read leader PR ${REPO}#${PR_NUM} (HTTP ${HTTP_CODE})" >&2
+            summarise "unknown" "$(params.fallback-source-branch)" \
+              "leader PR could not be read (HTTP ${HTTP_CODE}) - fell back to the caller's branch"
+            echo -n "$(params.fallback-source-branch)" > $(results.source-branch.path)
+            echo -n "false" > $(results.operator-pr-included.path)
+            echo -n "0" > $(results.component-count.path)
+            exit 0
+          fi
+
+          PR_BODY=$(jq -r '.body // ""' /tmp/pr.json)
+
+          # Every repo the leader PR references, deduplicated.  grep -c would
+          # count matching *lines*, and the body is frequently one line, so it
+          # would report 1 no matter how many repos were listed.
+          LISTED=$(printf '%s' "${PR_BODY}" \
+            | grep -oiE 'rhoai-rhtap/[A-Za-z0-9._-]+' | tr 'A-Z' 'a-z' | sort -u || true)
+          PR_COUNT=$(printf '%s' "${LISTED}" | grep -c . || true)
+          echo "Leader PR references ${PR_COUNT} repo(s):"
+          printf '%s\n' "${LISTED}"
+          echo -n "${PR_COUNT}" > $(results.component-count.path)
+
+          if printf '%s' "${LISTED}" | grep -qixF "${OP_REPO}"; then
+            # The operator itself is changing, so the ephemeral branch has to
+            # carry that change: fork from main, where the operator PR lands.
+            summarise "included" "main" \
+              "the leader PR changes the operator, so the ephemeral branch forks from main where that PR lands"
+            echo -n "main" > $(results.source-branch.path)
+            echo -n "true" > $(results.operator-pr-included.path)
+          else
+            # No operator change in flight, so the operator source is whatever
+            # is already released: fork from stable.
+            summarise "not included" "stable" \
+              "the leader PR changes ${PR_COUNT} component(s) but not the operator, so the operator is rebuilt from stable against them"
+            echo -n "stable" > $(results.source-branch.path)
+            echo -n "false" > $(results.operator-pr-included.path)
+          fi
+
+  # Always runs.  There is deliberately no `when` guard and no path that writes
+  # to main or stable: every change this pipeline makes lands on a branch that
+  # exists only for the duration of the gate.
+  - name: fork-operator-branch
+    runAfter:
+    - check-leader-pr
+    params:
+    - name: repo
+      value: $(params.operator-repo)
+    - name: source-branch
+      value: $(tasks.check-leader-pr.results.source-branch)
+    - name: branch-name
+      value: eg-$(params.leader-pr-number)
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    taskSpec:
+      params:
+      - name: repo
+        type: string
+      - name: source-branch
+        type: string
+      - name: branch-name
+        type: string
+      results:
+      - name: branch-name
+        description: Name of the created ephemeral branch
+      - name: branch-sha
+        description: SHA the ephemeral branch was forked at
+      workspaces:
+      - name: github-credentials
+        description: Secret workspace holding a 'token' key
+      steps:
+      - name: create-branch
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          REPO="$(params.repo)"
+          SOURCE="$(params.source-branch)"
+          BRANCH="$(params.branch-name)"
+          TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
+
+          # Get source branch SHA.  The ref response carries a single "sha" key,
+          # inside .object.  Tolerate both compact and pretty-printed JSON.
+          SOURCE_SHA=$(curl -sS -H "Authorization: token ${TOKEN}" \
+            "https://api.github.com/repos/${REPO}/git/ref/heads/${SOURCE}" \
+            | grep -o '"sha"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+
+          if [ -z "${SOURCE_SHA}" ]; then
+            echo "Could not resolve head of ${SOURCE} in ${REPO}. Check the branch exists and the token has read access." >&2
+            exit 1
+          fi
+          echo "Forking ${BRANCH} from ${SOURCE} @ ${SOURCE_SHA}"
+
+          # Try to create the branch; if it already exists, force it to match.
+          HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${TOKEN}" \
+            -X POST "https://api.github.com/repos/${REPO}/git/refs" \
+            -d "{\"ref\":\"refs/heads/${BRANCH}\",\"sha\":\"${SOURCE_SHA}\"}")
+
+          if [ "${HTTP_CODE}" = "422" ]; then
+            echo "Branch ${BRANCH} already exists - resetting it to ${SOURCE_SHA}"
+            PATCH_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+              -H "Authorization: token ${TOKEN}" \
+              -X PATCH "https://api.github.com/repos/${REPO}/git/refs/heads/${BRANCH}" \
+              -d "{\"sha\":\"${SOURCE_SHA}\",\"force\":true}")
+            if [ "${PATCH_CODE}" != "200" ]; then
+              echo "Failed to reset ${BRANCH} (HTTP ${PATCH_CODE})" >&2
+              exit 1
+            fi
+          elif [ "${HTTP_CODE}" != "201" ]; then
+            echo "Failed to create ${BRANCH} (HTTP ${HTTP_CODE})" >&2
+            exit 1
+          fi
+
+          echo -n "${BRANCH}" > $(results.branch-name.path)
+          echo -n "${SOURCE_SHA}" > $(results.branch-sha.path)
+
+  # Dispatch only.  The wait was split out into monitor-operator-processor so
+  # that dispatching and waiting can be reasoned about - and retried - apart.
+  # The run id is handed over as a result rather than re-discovered, because
+  # re-discovery is what makes a stale run look like ours.
+  - name: trigger-operator-processor-on-ephemeral-branch
+    runAfter:
+    - fork-operator-branch
+    params:
+    - name: repo
+      value: $(params.operator-repo)
+    - name: branch-name
+      value: $(tasks.fork-operator-branch.results.branch-name)
+    - name: leader-pr-number
+      value: $(params.leader-pr-number)
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    taskSpec:
+      params:
+      - name: repo
+        type: string
+      - name: branch-name
+        type: string
+      - name: leader-pr-number
+        type: string
+      results:
+      - name: previous-run-id
+        description: |
+          Newest workflow_dispatch run that existed before we dispatched.  The
+          monitor treats any id equal to this as "ours has not started yet",
+          so a previous run's success can never satisfy the gate.
+      workspaces:
+      - name: github-credentials
+        description: Secret workspace holding a 'token' key
+      steps:
+      - name: dispatch
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          REPO="$(params.repo)"
+          BRANCH="$(params.branch-name)"
+          TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
+
+          RUNS_URL="https://api.github.com/repos/${REPO}/actions/runs?branch=${BRANCH}&event=workflow_dispatch&per_page=1"
+
+          # Record the newest pre-existing run so a previous run on this branch is
+          # never mistaken for ours - otherwise a stale success would pass the gate
+          # instantly without operator-processor having run at all.
+          PREV_ID=$(curl -sS -H "Authorization: token ${TOKEN}" "${RUNS_URL}" \
+            | grep -o '"id"[[:space:]]*:[[:space:]]*[0-9]*' | head -1 | tr -cd '0-9' || true)
+          echo "Newest pre-existing workflow_dispatch run on ${BRANCH}: ${PREV_ID:-none}"
+          echo -n "${PREV_ID}" > $(results.previous-run-id.path)
+
+          DISPATCH_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${TOKEN}" \
+            -X POST "https://api.github.com/repos/${REPO}/actions/workflows/operator-processor.yaml/dispatches" \
+            -d "{\"ref\":\"${BRANCH}\",\"inputs\":{\"eg-mode\":\"true\",\"eg-branch\":\"${BRANCH}\",\"leader-pr-number\":\"$(params.leader-pr-number)\"}}")
+
+          if [ "${DISPATCH_CODE}" != "204" ]; then
+            echo "workflow_dispatch was not accepted (HTTP ${DISPATCH_CODE})" >&2
+            exit 1
+          fi
+          echo "Dispatched operator-processor on ${BRANCH}"
+
+  - name: monitor-operator-processor
+    runAfter:
+    - trigger-operator-processor-on-ephemeral-branch
+    params:
+    - name: repo
+      value: $(params.operator-repo)
+    - name: branch-name
+      value: $(tasks.fork-operator-branch.results.branch-name)
+    - name: forked-from
+      value: $(tasks.check-leader-pr.results.source-branch)
+    - name: operator-pr-included
+      value: $(tasks.check-leader-pr.results.operator-pr-included)
+    - name: previous-run-id
+      value: $(tasks.trigger-operator-processor-on-ephemeral-branch.results.previous-run-id)
+    - name: timeout-minutes
+      value: $(params.processor-timeout-minutes)
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    taskSpec:
+      description: |
+        Waits for the dispatched operator-processor run, then reads back the
+        commit it pushed.  That commit - not the pipeline's own revision - is
+        what the EG build builds, so it is what every downstream reference
+        must be derived from.
+      params:
+      - name: repo
+        type: string
+      - name: branch-name
+        type: string
+      - name: forked-from
+        type: string
+      - name: operator-pr-included
+        type: string
+      - name: previous-run-id
+        type: string
+      - name: timeout-minutes
+        type: string
+      results:
+      - name: processor-commit
+        description: SHA operator-processor pushed to the ephemeral branch
+      - name: branch-url
+        description: Link to the ephemeral branch
+      - name: commit-url
+        description: Link to the commit that will be built
+      workspaces:
+      - name: github-credentials
+        description: Secret workspace holding a 'token' key
+      steps:
+      - name: wait-and-read-commit
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          REPO="$(params.repo)"
+          BRANCH="$(params.branch-name)"
+          PREV_ID="$(params.previous-run-id)"
+          TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
+
+          RUNS_URL="https://api.github.com/repos/${REPO}/actions/runs?branch=${BRANCH}&event=workflow_dispatch&per_page=1"
+
+          # Poll in 30s steps so the timeout is expressed in minutes.
+          ATTEMPTS=$(( $(params.timeout-minutes) * 2 ))
+          CONCLUDED=""
+
+          for i in $(seq 1 "${ATTEMPTS}"); do
+            RESP=$(curl -sS -H "Authorization: token ${TOKEN}" "${RUNS_URL}")
+            RUN_ID=$(echo "${RESP}" | grep -o '"id"[[:space:]]*:[[:space:]]*[0-9]*' | head -1 | tr -cd '0-9' || true)
+
+            if [ -n "${RUN_ID}" ] && [ "${RUN_ID}" != "${PREV_ID}" ]; then
+              # "conclusion" is null while in progress, so this stays empty until done.
+              CONCLUDED=$(echo "${RESP}" | grep -o '"conclusion"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+              if [ -n "${CONCLUDED}" ]; then
+                echo "operator-processor run ${RUN_ID} concluded: ${CONCLUDED}"
+                break
+              fi
+            fi
+
+            echo "Waiting for operator-processor... attempt ${i}/${ATTEMPTS}"
+            sleep 30
+          done
+
+          if [ -z "${CONCLUDED}" ]; then
+            echo "Timed out after $(params.timeout-minutes) minutes waiting for operator-processor" >&2
+            exit 1
+          fi
+          if [ "${CONCLUDED}" != "success" ]; then
+            echo "operator-processor did not succeed (${CONCLUDED})" >&2
+            exit 1
+          fi
+
+          # Read the branch head back rather than assuming it.  The processor
+          # pins every component to the digests the leader PR is gating, and
+          # that commit is the only thing worth building.
+          SHA=$(curl -sS -H "Authorization: token ${TOKEN}" \
+            "https://api.github.com/repos/${REPO}/git/ref/heads/${BRANCH}" \
+            | grep -o '"sha"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+
+          if [ -z "${SHA}" ]; then
+            echo "Could not read head of ${BRANCH} after operator-processor finished" >&2
+            exit 1
+          fi
+
+          if [ "$(params.operator-pr-included)" = "true" ]; then
+            WHY="the leader PR includes an operator PR"
+          else
+            WHY="the leader PR includes no operator PR"
+          fi
+
+          BRANCH_URL="https://github.com/${REPO}/tree/${BRANCH}"
+          COMMIT_URL="https://github.com/${REPO}/commit/${SHA}"
+
+          echo "Built from:"
+          echo "  repo          ${REPO}"
+          echo "  branch        ${BRANCH}  (forked from $(params.forked-from) - ${WHY})"
+          echo "  commit        ${SHA}"
+          echo "  branch url    ${BRANCH_URL}"
+          echo "  commit url    ${COMMIT_URL}"
+
+          echo -n "${SHA}"         > $(results.processor-commit.path)
+          echo -n "${BRANCH_URL}"  > $(results.branch-url.path)
+          echo -n "${COMMIT_URL}"  > $(results.commit-url.path)
+
+  # The build itself is a separate PaC PipelineRun, triggered by the commit
+  # operator-processor just pushed.  PaC reports every PipelineRun as a
+  # check-run against that commit, so the gate can follow it over the GitHub
+  # API without needing read access to Tekton resources in the cluster.
+  - name: monitor-operator-build
+    runAfter:
+    - monitor-operator-processor
+    params:
+    - name: repo
+      value: $(params.operator-repo)
+    - name: commit
+      value: $(tasks.monitor-operator-processor.results.processor-commit)
+    - name: check-name
+      value: $(params.build-check-name)
+    - name: output-image
+      value: $(params.operator-output-image)
+    - name: timeout-minutes
+      value: $(params.build-timeout-minutes)
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    taskSpec:
+      params:
+      - name: repo
+        type: string
+      - name: commit
+        type: string
+      - name: check-name
+        type: string
+      - name: output-image
+        type: string
+      - name: timeout-minutes
+        type: string
+      results:
+      - name: build-status
+        description: success, failure, or timeout
+      - name: image-ref
+        description: Image the EG build produced, by commit
+      workspaces:
+      - name: github-credentials
+        description: Secret workspace holding a 'token' key
+      steps:
+      - name: watch-build
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          microdnf install -y jq >/dev/null
+
+          REPO="$(params.repo)"
+          SHA="$(params.commit)"
+          CHECK="$(params.check-name)"
+          TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
+
+          # Tag the same way rhods-operator-gap-eg-push.yaml does, so the
+          # reference reported here is the one that was actually pushed.
+          IMAGE_REF="$(params.output-image):eg-${SHA}"
+          echo -n "${IMAGE_REF}" > $(results.image-ref.path)
+
+          CHECKS_URL="https://api.github.com/repos/${REPO}/commits/${SHA}/check-runs?per_page=100"
+
+          ATTEMPTS=$(( $(params.timeout-minutes) * 2 ))
+
+          for i in $(seq 1 "${ATTEMPTS}"); do
+            RESP=$(curl -sS -H "Authorization: token ${TOKEN}" \
+              -H "Accept: application/vnd.github+json" "${CHECKS_URL}")
+
+            # PaC prefixes the check-run name with the PipelineRun name, so match
+            # on prefix rather than equality - the suffix varies per run.
+            STATUS=$(jq -r --arg c "${CHECK}" \
+              '[.check_runs[] | select(.name | startswith($c))] | sort_by(.started_at) | last | .status // ""' <<< "${RESP}")
+            CONCLUSION=$(jq -r --arg c "${CHECK}" \
+              '[.check_runs[] | select(.name | startswith($c))] | sort_by(.started_at) | last | .conclusion // ""' <<< "${RESP}")
+
+            if [ "${STATUS}" = "completed" ]; then
+              echo "EG build check-run '${CHECK}' concluded: ${CONCLUSION}"
+              if [ "${CONCLUSION}" = "success" ]; then
+                echo "Image: ${IMAGE_REF}"
+                echo -n "success" > $(results.build-status.path)
+                exit 0
+              fi
+              echo "EG build did not succeed (${CONCLUSION})" >&2
+              echo -n "failure" > $(results.build-status.path)
+              exit 1
+            fi
+
+            if [ -z "${STATUS}" ]; then
+              echo "Waiting for PaC to register the build on ${SHA:0:7}... attempt ${i}/${ATTEMPTS}"
+            else
+              echo "EG build ${STATUS}... attempt ${i}/${ATTEMPTS}"
+            fi
+            sleep 30
+          done
+
+          echo "Timed out after $(params.timeout-minutes) minutes waiting for the EG build" >&2
+          echo -n "timeout" > $(results.build-status.path)
+          exit 1
+
+  finally:
+
+  # fork-operator-branch always creates a branch, so something must always
+  # remove it - otherwise every run leaves an orphan behind.  Deleting it is
+  # safe because the build tags the image eg-<branch>-<sha> as well as by
+  # commit, and neither tag depends on the ref still existing.
+  - name: cleanup-ephemeral-branch
+    params:
+    - name: repo
+      value: $(params.operator-repo)
+    - name: branch-name
+      value: eg-$(params.leader-pr-number)
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    taskSpec:
+      params:
+      - name: repo
+        type: string
+      - name: branch-name
+        type: string
+      workspaces:
+      - name: github-credentials
+        description: Secret workspace holding a 'token' key
+      steps:
+      - name: delete-branch
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          REPO="$(params.repo)"
+          BRANCH="$(params.branch-name)"
+          TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
+
+          # The branch name is recomputed from the leader PR number rather than
+          # consumed from fork-operator-branch's result: a finally task that
+          # references a failed task's result is skipped entirely, which is
+          # exactly when cleanup matters most.
+          CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${TOKEN}" \
+            -X DELETE "https://api.github.com/repos/${REPO}/git/refs/heads/${BRANCH}")
+
+          case "${CODE}" in
+            204) echo "Deleted ephemeral branch ${BRANCH}" ;;
+            404) echo "Branch ${BRANCH} not found - nothing to clean up" ;;
+            *)   echo "Could not delete ${BRANCH} (HTTP ${CODE})" >&2 ;;
+          esac
