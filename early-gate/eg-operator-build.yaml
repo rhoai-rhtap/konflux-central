@@ -143,12 +143,7 @@ spec:
       taskSpec:
         description: |
           Reads the leader PR to decide what the EG build should do.
-
-          Like get-latest-commit, this task deliberately has no `when` guard.  Every
-          build task consumes its skip-eg-build result, and in Tekton a task that
-          references the results of a skipped task is itself skipped - guarding this
-          task on enable-eg-orchestration would therefore skip the entire build in
-          direct mode.  It runs in both modes and branches internally.
+          
         params:
           - name: enable-eg-orchestration
             type: string
