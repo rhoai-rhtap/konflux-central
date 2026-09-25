@@ -72,6 +72,33 @@ spec:
     description: |
       Expiry for throwaway OCI artifacts (e.g. 1h, 2d, 3w).  Used for the
       group snapshot trusted artifact.
+  - name: enable-group-snapshot
+    type: string
+    default: "false"
+    description: |
+      Whether to run the group-snapshot block (resolve-group-configuration,
+      generate-snapshot, audit-snapshot).
+
+      Off by default because the block cannot yet complete against RHOAI.
+      Two preconditions are unmet:
+
+        1. generate-snapshot resolves each component digest through the
+           anonymous Quay API.  That works upstream because
+           quay.io/opendatahub is public; quay.io/rhoai is not - every
+           request comes back {"error_type": "invalid_token"}, so the
+           digest and the git.url/git.commit labels come back empty and
+           the task exits 1.  Enabling this needs a Quay pull credential
+           wired into the task.
+
+        2. resolve-group-configuration looks the leader repo up in
+           config/component_repo_map.json.  The leader is
+           red-hat-data-services/gated-artifacts-promoter, which is not a
+           built component and so is deliberately absent from that map.
+
+      The orchestration block downstream (check-leader-pr onward) has no
+      result dependency on the snapshot, only an ordering one, so it runs
+      normally when this is off - Tekton propagates skips through result
+      references, not through runAfter.
   - name: build-check-name
     type: string
     default: "rhods-operator-gap-eg-on-push"
@@ -159,6 +186,10 @@ spec:
   - name: resolve-group-configuration
     runAfter:
     - init
+    when:
+    - input: $(params.enable-group-snapshot)
+      operator: in
+      values: ["true"]
     params:
     - name: leader-pr-repo
       value: $(params.leader-pr-repo)
@@ -184,6 +215,10 @@ spec:
   - name: generate-snapshot
     runAfter:
     - resolve-group-configuration
+    when:
+    - input: $(params.enable-group-snapshot)
+      operator: in
+      values: ["true"]
     params:
     - name: COMPONENTS
       value: $(tasks.resolve-group-configuration.results.group-components)
