@@ -16,6 +16,9 @@ spec:
 
     The sequence is:
 
+      resolve-group-...      read the leader PR, expand it into a component set
+      generate-snapshot      pin each of those components to a quay digest
+      audit-snapshot         log the snapshot, flag whether it has the operator
       check-leader-pr        read the leader PR, decide main vs stable
       fork-operator-branch   always create eg-<leader-pr-number>
       trigger-operator-...   dispatch operator-processor, return the run id
@@ -63,6 +66,12 @@ spec:
     type: string
     default: "stable"
     description: Branch to fork from when the leader PR cannot be read
+  - name: image-expires-after
+    type: string
+    default: "7d"
+    description: |
+      Expiry for throwaway OCI artifacts (e.g. 1h, 2d, 3w).  Used for the
+      group snapshot trusted artifact.
   - name: build-check-name
     type: string
     default: "rhods-operator-gap-eg-on-push"
@@ -139,12 +148,160 @@ spec:
       resolver: bundles
 
   # --------------------------------------------------------------------------
+  # Group snapshot block
+  # --------------------------------------------------------------------------
+
+  # resolve-group-configuration reads the leader PR description and works out
+  # which components are in the group: the leader repo's own components always,
+  # plus the components of every rhoai-rhtap PR listed under an "## Early Gate"
+  # heading.  Upstream takes the PR off the PaC labels; this pipeline is driven
+  # by the Leader PR Manager instead, so the leader PR is passed in.
+  - name: resolve-group-configuration
+    runAfter:
+    - init
+    params:
+    - name: leader-pr-repo
+      value: $(params.leader-pr-repo)
+    - name: leader-pr-number
+      value: $(params.leader-pr-number)
+    workspaces:
+    - name: basic-auth
+      workspace: github-credentials
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: main
+      - name: pathInRepo
+        value: early-gate/tasks/resolve-group-configuration.yaml
+
+  # Resolves each of those components to a concrete quay digest - the
+  # rhoai-pr-<N> image when the component's own PR build has published one,
+  # otherwise the rhoai-3.6 fallback - and stores the result as a trusted
+  # artifact.
+  - name: generate-snapshot
+    runAfter:
+    - resolve-group-configuration
+    params:
+    - name: COMPONENTS
+      value: $(tasks.resolve-group-configuration.results.group-components)
+    - name: leader-pr-repo
+      value: $(params.leader-pr-repo)
+    - name: leader-pr-number
+      value: $(params.leader-pr-number)
+    - name: ociStorage
+      value: $(params.operator-output-image).snapshot
+    - name: ociArtifactExpiresAfter
+      value: $(params.image-expires-after)
+    workspaces:
+    - name: basic-auth
+      workspace: github-credentials
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: main
+      - name: pathInRepo
+        value: early-gate/tasks/generate-snapshot-for-group-testing.yaml
+
+  # Logs the snapshot and reports whether the operator itself is part of it.
+  # Kept inline, as upstream keeps it.
+  - name: audit-snapshot
+    runAfter:
+    - generate-snapshot
+    params:
+    - name: COMPONENTS
+      value: $(tasks.generate-snapshot.results.group-components)
+    taskSpec:
+      params:
+      - name: COMPONENTS
+        description: List of components in the group
+      results:
+      - name: pull-request-author
+      - name: pull-request-number
+      - name: git-repo
+      - name: git-org
+      - name: git-revision
+      - name: snapshot-contains-operator
+      volumes:
+      - name: workdir
+        emptyDir: {}
+      stepTemplate:
+        volumeMounts:
+        - mountPath: /var/workdir
+          name: workdir
+      steps:
+      - name: use-trusted-artifact
+        image: quay.io/redhat-appstudio/build-trusted-artifacts:latest@sha256:81c4864dae6bb11595f657be887e205262e70086a05ed16ada827fd6391926ac
+        args:
+        - use
+        - $(tasks.generate-snapshot.results.SNAPSHOT_ARTIFACT)=/var/workdir/snapshot
+      - name: audit-snapshot
+        image: quay.io/konflux-ci/konflux-test:stable
+        workingDir: /workspace
+        env:
+        - name: SNAPSHOT_FILE
+          value: /var/workdir/snapshot/snapshot.json
+        - name: COMPONENTS
+          value: $(params.COMPONENTS)
+        - name: PR_AUTHOR
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['pipelinesascode.tekton.dev/sender']
+        - name: PR_NUMBER
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['pipelinesascode.tekton.dev/pull-request']
+        - name: GIT_REPO
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['pipelinesascode.tekton.dev/url-repository']
+        - name: GIT_ORG
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['pipelinesascode.tekton.dev/url-org']
+        - name: GIT_REVISION
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['pipelinesascode.tekton.dev/sha']
+        script: |
+          #!/bin/bash
+          set -e
+          SNAPSHOT=$(cat "${SNAPSHOT_FILE}")
+          echo "SNAPSHOT=${SNAPSHOT}"
+          SNAPSHOT_CONTAINS_ODH_OPERATOR=false
+          # Parse JSON and iterate through each component
+          while IFS= read -r row; do
+              COMPONENT_NAME=$(echo "$row" | base64 -d | jq -r '.key')
+              IMAGE=$(jq -r --arg component_name "${COMPONENT_NAME}" '.[$component_name].image' <<< "${SNAPSHOT}")
+              if [[ "${COMPONENT_NAME}" == "odh-operator-v3-6" ]] && [[ "${IMAGE}" == "quay.io/rhoai/odh-rhel9-operator"* ]]; then
+                  SNAPSHOT_CONTAINS_ODH_OPERATOR=true
+              fi
+              GIT_COMMIT=$(jq -r --arg component_name "${COMPONENT_NAME}" '.[$component_name]."git.commit"' <<< "${SNAPSHOT}")
+              GIT_URL=$(jq -r --arg component_name "${COMPONENT_NAME}" '.[$component_name]."git.url"' <<< "${SNAPSHOT}")
+              echo "${COMPONENT_NAME} IMAGE: ${IMAGE}"
+              echo "GIT_COMMIT=${GIT_COMMIT}"
+              echo "GIT_URL=${GIT_URL}"
+          done < <(echo "$COMPONENTS" | jq -r 'to_entries[] | @base64')
+
+          echo -n "${PR_AUTHOR}" > "$(results.pull-request-author.path)"
+          echo -n "${PR_NUMBER}" > "$(results.pull-request-number.path)"
+          echo -n "${GIT_REPO}" > "$(results.git-repo.path)"
+          echo -n "${GIT_ORG}" > "$(results.git-org.path)"
+          echo -n "${GIT_REVISION}" > "$(results.git-revision.path)"
+          echo -n "${SNAPSHOT_CONTAINS_ODH_OPERATOR}" > "$(results.snapshot-contains-operator.path)"
+
+  # --------------------------------------------------------------------------
   # Block 1: Operator build (orchestrated, not performed here)
   # --------------------------------------------------------------------------
 
   - name: check-leader-pr
     runAfter:
-    - init
+    - audit-snapshot
     params:
     - name: leader-pr-repo
       value: $(params.leader-pr-repo)
