@@ -1,0 +1,96 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  annotations:
+    build.appstudio.openshift.io/repo: https://github.com/rhoai-rhtap/rhods-operator-gap?rev={{revision}}
+    build.appstudio.redhat.com/commit_sha: '{{revision}}'
+    build.appstudio.redhat.com/target_branch: '{{target_branch}}'
+    pipelinesascode.tekton.dev/cancel-in-progress: "false"
+    pipelinesascode.tekton.dev/max-keep-runs: "3"
+    # No build.appstudio.openshift.io/build-nudge-files here, on purpose.  The
+    # release push pipeline nudges downstream repos with the digest it just
+    # built; an early-gate build is a throwaway validation of an ephemeral
+    # branch and must never open nudge PRs anywhere.
+    #
+    # Two pushes land on the ephemeral branch: the one that creates it, and the
+    # one operator-processor makes once it has pinned every component digest.
+    # Only the second is worth building - the first is just a fork of
+    # main/stable that the release pipelines already cover.  Requiring
+    # build/operands-map.yaml to have changed selects exactly the processor's
+    # commit, because pinning the digests is what rewrites that file.
+    pipelinesascode.tekton.dev/on-cel-expression: |
+      event == "push"
+      && target_branch.startsWith("eg-")
+      && "build/operands-map.yaml".pathChanged()
+  labels:
+    appstudio.openshift.io/application: gap-poc
+    appstudio.openshift.io/component: rhods-operator-gap
+    pipelines.appstudio.openshift.io/type: build
+  name: rhods-operator-gap-eg-on-push
+  namespace: rhoai-tenant
+spec:
+  timeouts:
+    pipeline: 4h
+  params:
+  - name: git-url
+    value: '{{source_url}}'
+  # The ephemeral branch's HEAD - i.e. the commit operator-processor pushed,
+  # with every component pinned to the digests the leader PR is gating.  PaC
+  # expands this from the push event, so unlike the standalone EG pipeline
+  # there is no window in which the tag can name a different commit.
+  - name: revision
+    value: '{{revision}}'
+  # eg-<leader-pr-number>-<sha>.  The ephemeral branch is deleted as soon as
+  # the gate finishes, so this is the tag that keeps the image reachable.
+  - name: additional-tags
+    value:
+    - '{{target_branch}}-{{revision}}'
+  - name: output-image
+    value: quay.io/redhat-user-workloads/rhoai-tenant/rhods-operator-gap:eg-{{revision}}
+  - name: dockerfile
+    value: Dockerfiles/Dockerfile.konflux
+  - name: path-context
+    value: .
+  - name: hermetic
+    value: true
+  - name: prefetch-input
+    value: |
+      [
+        {
+          "type": "gomod",
+          "path": "."
+        },
+        {
+          "type": "rpm",
+          "path": "."
+        }
+      ]
+  - name: build-source-image
+    value: true
+  - name: build-image-index
+    value: true
+  - name: build-platforms
+    value:
+    - linux/x86_64
+    - linux/ppc64le
+    - linux/s390x
+    - linux-m2xlarge/arm64
+  pipelineRef:
+    resolver: git
+    params:
+    - name: url
+      value: https://github.com/rhoai-rhtap/konflux-central.git
+    # Pinned to main rather than '{{ target_branch }}': target_branch here is
+    # the ephemeral eg-* branch, which exists in the operator repo only and
+    # would never resolve against this repo.
+    - name: revision
+      value: 'main'
+    - name: pathInRepo
+      value: pipelines/multi-arch-container-build.yaml
+  taskRunTemplate:
+    serviceAccountName: build-pipeline-rhods-operator-gap
+  workspaces:
+  - name: git-auth
+    secret:
+      secretName: '{{ git_auth_secret }}'
+status: {}
