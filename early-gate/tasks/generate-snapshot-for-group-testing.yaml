@@ -1,0 +1,335 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: generate-snapshot-for-group-testing
+spec:
+  description: |
+    RHOAI adaptation of opendatahub-io/odh-konflux-central's
+    early-gate/tasks/generate-snapshot-for-group-testing.yaml.
+
+    The digest-resolution logic is unchanged.  What differs is the component
+    map it falls back to (rhoai-rhtap/konflux-central), the per-PR tag it
+    looks for (rhoai-pr-<N> rather than odh-pr-<N>) and the tag it falls back
+    to when that PR image has not been published yet (rhoai-3.6, which is
+    what the RHOAI push pipelines tag as - their output-image is
+    quay.io/rhoai/<repo>:{{target_branch}}).
+
+    As with resolve-group-configuration, leader-pr-repo/leader-pr-number are
+    accepted because the RHOAI early-gate pipeline is driven by the Leader PR
+    Manager rather than by PaC, so the pipelinesascode.tekton.dev labels this
+    task reads upstream are not present.
+  workspaces:
+    - name: basic-auth
+      optional: true
+  params:
+    - name: COMPONENTS
+      description: |
+        List of components in the group (JSON).
+        Format: {"comp1": "path1", "comp2": "path2"} OR
+                {"comp1": {"quay_path": "path1", "pr": "123"}, "comp2": {...}}
+        If empty, fetched from component_repo_map.json using REPO_NAME.
+      default: ""
+    - name: fallback-tag
+      type: string
+      default: rhoai-3.6
+      description: Quay tag when PR image is missing
+    - name: leader-pr-repo
+      type: string
+      default: ""
+      description: |
+        org/repo of the leader PR.  Overrides the PaC labels when set; leave
+        empty to resolve from the pipelinesascode.tekton.dev labels instead.
+    - name: leader-pr-number
+      type: string
+      default: ""
+      description: Leader PR number.  Overrides the PaC label when set.
+    - name: ociStorage
+      type: string
+      description: OCI repository for storing the SNAPSHOT trusted artifact
+    - name: ociArtifactExpiresAfter
+      type: string
+      default: "1h"
+      description: Expiration for the SNAPSHOT OCI artifact
+  results:
+  - description: OCI trusted artifact URI containing the generated snapshot JSON
+    name: SNAPSHOT_ARTIFACT
+  - description: Resolved COMPONENTS JSON used to generate the snapshot
+    name: group-components
+  - description: Warning message if any components fell back to stable (empty if all PRs found)
+    name: fallback-warning
+  - description: Component summary table for PR comment (TSV format - PR component tag status digest)
+    name: component-table
+  volumes:
+  - name: workdir
+    emptyDir: {}
+  stepTemplate:
+    volumeMounts:
+    - mountPath: /var/workdir
+      name: workdir
+  steps:
+    - name: generate-snapshot
+      image: quay.io/konflux-ci/konflux-test:stable
+      workingDir: /workspace
+      env:
+        - name: COMPONENTS
+          value: $(params.COMPONENTS)
+        - name: FALLBACK_TAG
+          value: $(params.fallback-tag)
+        - name: WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND
+          value: $(workspaces.basic-auth.bound)
+        - name: WORKSPACE_BASIC_AUTH_DIRECTORY_PATH
+          value: $(workspaces.basic-auth.path)
+        - name: PR_NUMBER
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['pipelinesascode.tekton.dev/pull-request']
+        - name: REPO_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['pipelinesascode.tekton.dev/url-repository']
+        - name: LEADER_PR_REPO
+          value: $(params.leader-pr-repo)
+        - name: LEADER_PR_NUMBER
+          value: $(params.leader-pr-number)
+      script: |
+        #!/bin/bash
+        set -e
+        cat /etc/*release
+
+        # --- Leader PR parameters win over the PaC labels ---
+        # See the task description: this pipeline is not PaC-triggered, so the
+        # fieldRefs above resolve to the empty string.
+        if [[ -n "${LEADER_PR_REPO}" ]]; then
+          REPO_NAME="${LEADER_PR_REPO##*/}"
+        fi
+        if [[ -n "${LEADER_PR_NUMBER}" ]]; then
+          PR_NUMBER="${LEADER_PR_NUMBER}"
+        fi
+
+        # --- Fetch COMPONENTS from component_repo_map.json if not provided ---
+        if [[ -z "${COMPONENTS}" ]]; then
+          if [[ -z "${REPO_NAME}" ]]; then
+            echo "ERROR: Both COMPONENTS and REPO_NAME are empty. Provide at least one." >&2
+            exit 1
+          fi
+          echo "COMPONENTS not provided, fetching from component_repo_map.json for REPO_NAME=${REPO_NAME}" >&2
+          COMPONENT_MAP_URL="https://raw.githubusercontent.com/rhoai-rhtap/konflux-central/main/config/component_repo_map.json"
+          COMPONENT_MAP=$(curl -sSf "${COMPONENT_MAP_URL}")
+          COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo]')
+          if [[ -z "${COMPONENTS}" || "${COMPONENTS}" == "null" ]]; then
+            echo "ERROR: No entry found for REPO_NAME=${REPO_NAME} in component_repo_map.json" >&2
+            exit 1
+          fi
+          echo "Fetched COMPONENTS for ${REPO_NAME}: ${COMPONENTS}" >&2
+        fi
+
+        echo -n "${COMPONENTS}" > "$(results.group-components.path)"
+
+        json_string="$COMPONENTS"
+        echo ${COMPONENTS}
+
+        # Temporary file to store results
+        temp_file=$(mktemp)
+        echo "{}" > "$temp_file"
+
+        # Track fallback warnings and component table (use temp files to avoid subshell issues)
+        FALLBACK_WARNINGS_FILE=$(mktemp)
+        COMPONENT_TABLE_FILE=$(mktemp)
+        > "$FALLBACK_WARNINGS_FILE"
+        > "$COMPONENT_TABLE_FILE"
+
+        DEFAULT_PR_NUMBER="${PR_NUMBER}"
+
+        # Parse JSON and iterate through each component
+        while IFS= read -r row; do
+            # Decode the base64 encoded row
+            component=$(echo "$row" | base64 -d | jq -r '.key')
+            value_raw=$(echo "$row" | base64 -d | jq -c '.value')
+
+            # Check if value is a string (old format) or object (new format with PR metadata)
+            value_type=$(echo "$value_raw" | jq -r 'type')
+
+            if [[ "$value_type" == "object" ]]; then
+              # New format: {"quay_path": "...", "pr": "123"}
+              repo_path=$(echo "$value_raw" | jq -r '.quay_path')
+              component_pr=$(echo "$value_raw" | jq -r '.pr')
+              TAG="rhoai-pr-${component_pr}"
+              echo "component=${component} (from PR #${component_pr})"
+            else
+              # Old format: string path
+              repo_path=$(echo "$value_raw" | jq -r '.')
+              TAG="rhoai-pr-${DEFAULT_PR_NUMBER}"
+              echo "component=${component} (using default PR #${DEFAULT_PR_NUMBER})"
+            fi
+
+            echo "repo_path=${repo_path}"
+
+            # Check if PR-specific image exists
+            IMAGE_STATUS=""
+            if skopeo inspect "docker://quay.io/${repo_path}:${TAG}" &>/dev/null; then
+              echo "✓ Found image with tag ${TAG}"
+              IMAGE_STATUS="ready"
+            else
+              echo "⚠️  WARNING: Component '${component}' does not have PR image for tag ${TAG}" >&2
+              echo "   Quay query returned: 404 Not Found" >&2
+              echo "   Reason: PR build may still be in progress" >&2
+              echo "   Action: Falling back to ${FALLBACK_TAG} tag" >&2
+              echo "   Impact: Group test will use stable image instead of PR code" >&2
+
+              # Track this fallback for PR comment
+              if [[ "$value_type" == "object" ]]; then
+                echo "- Component \`${component}\` from PR #${component_pr}: using \`${FALLBACK_TAG}\` (PR build not ready)" >> "$FALLBACK_WARNINGS_FILE"
+              fi
+
+              TAG=${FALLBACK_TAG}
+              IMAGE_STATUS="fallback"
+            fi
+
+
+            # Construct full quay URL
+            full_repo="quay.io/${repo_path}"
+
+            echo "Processing component: $component" >&2
+            echo "Repository: $full_repo" >&2
+
+            # Extract namespace and repository name from repo_path
+            # Format: namespace/project/repository
+            namespace=${repo_path%/*}
+            repository=${repo_path##*/}
+
+            # Query Quay API to get the digest for the tag
+            api_url="https://quay.io/api/v1/repository/${namespace}/${repository}/tag/?specificTag=${TAG}"
+
+            echo "Querying: $api_url" >&2
+
+            # Make API request and extract the manifest digest
+            response=$(curl -s "$api_url")
+
+            # Get the latest (first) tag's manifest digest
+            manifest_digest=$(echo "$response" | jq -r '.tags[0].manifest_digest // empty')
+
+            if [ -z "$manifest_digest" ]; then
+                echo "Warning: No digest found for $component with tag $TAG" >&2
+                full_image_uri="${full_repo}:${TAG}"
+                git_url=""
+                git_commit=""
+            else
+                echo "Found digest: $manifest_digest" >&2
+                full_image_uri="${full_repo}@${manifest_digest}"
+
+                # Query Quay API to get the manifest details and extract labels
+                manifest_api_url="https://quay.io/api/v1/repository/${namespace}/${repository}/manifest/${manifest_digest}"
+                echo "Querying manifest: $manifest_api_url" >&2
+
+                manifest_response=$(curl -s "$manifest_api_url")
+                echo "manifest_response=${manifest_response}" >&2
+
+                # Check if this is a manifest list (multi-arch image)
+                is_manifest_list=$(echo "$manifest_response" | jq -r '.is_manifest_list // false')
+                echo "Is manifest list: $is_manifest_list" >&2
+
+                if [ "$is_manifest_list" = "true" ]; then
+                    echo "Multi-arch image detected, extracting first manifest digest" >&2
+
+                    # Get the digest of the first manifest in the list
+                    first_manifest_digest=$(echo "$manifest_response" | jq -r '.manifest_data' | jq -r '.manifests[0].digest // empty')
+
+                    if [ -z "$first_manifest_digest" ]; then
+                        echo "Warning: No manifest found in manifest list" >&2
+                        git_url=""
+                        git_commit=""
+                    else
+                        echo "First manifest digest: $first_manifest_digest" >&2
+
+                        # Fetch the child manifest and resolve its config blob. Quay's
+                        # /labels endpoint does not expose OCI config labels for child
+                        # manifests in a multi-arch image.
+                        specific_manifest_api_url="https://quay.io/api/v1/repository/${namespace}/${repository}/manifest/${first_manifest_digest}"
+                        echo "Querying specific manifest: $specific_manifest_api_url" >&2
+
+                        specific_manifest_response=$(curl -fsS "$specific_manifest_api_url")
+                        echo "specific_manifest_response=${specific_manifest_response}"
+                        config_digest=$(echo "$specific_manifest_response" | jq -r '.manifest_data' | jq -r '.config.digest // empty')
+
+                        if [ -z "$config_digest" ]; then
+                            echo "Warning: No config found for child manifest $first_manifest_digest" >&2
+                            git_url=""
+                            git_commit=""
+                        else
+                            config_api_url="https://quay.io/v2/${namespace}/${repository}/blobs/${config_digest}"
+                            echo "Querying image config: $config_api_url" >&2
+                            config_response=$(curl -fsSL "$config_api_url")
+                            git_url=$(echo "$config_response" | jq -r '.config.Labels["git.url"] // empty')
+                            git_commit=$(echo "$config_response" | jq -r '.config.Labels["git.commit"] // empty')
+                        fi
+                    fi
+                else
+                    echo "Single-arch image, extracting labels directly" >&2
+
+                    # Extract git.url and git.commit labels from current manifest
+                    git_url=$(echo "$manifest_response" | jq -r '.config.config.Labels["git.url"] // empty')
+                    git_commit=$(echo "$manifest_response" | jq -r '.config.config.Labels["git.commit"] // empty')
+                fi
+
+                echo "Git URL: $git_url" >&2
+                echo "Git Commit: $git_commit" >&2
+            fi
+
+            if [ -z "$git_url" ] || [ -z "$git_commit" ]; then
+                echo "ERROR: Required git metadata is missing for $component" >&2
+                exit 1
+            fi
+
+            # Add to output JSON with image URI, git.url, and git.commit
+            jq --arg key "$component" \
+               --arg image "$full_image_uri" \
+               --arg giturl "$git_url" \
+               --arg gitcommit "$git_commit" \
+               --arg image_tag "$TAG" \
+               '. + {($key): {image: $image, "git.url": $giturl, "git.commit": $gitcommit, "image_tag": $image_tag}}' \
+               "$temp_file" > "${temp_file}.tmp" && mv "${temp_file}.tmp" "$temp_file"
+
+            # Add to component table for PR comment (only for group testing components)
+            if [[ "$value_type" == "object" ]]; then
+              SHORT_DIGEST=$(echo "$manifest_digest" | cut -c 1-12)
+              if [[ -z "$SHORT_DIGEST" ]]; then
+                SHORT_DIGEST="N/A"
+              fi
+              echo "${component_pr}|${component}|${TAG}|${IMAGE_STATUS}|${SHORT_DIGEST}" >> "$COMPONENT_TABLE_FILE"
+            fi
+
+            echo "" >&2
+        done < <(echo "$json_string" | jq -r 'to_entries[] | @base64')
+
+        # Print final output JSON
+        echo "Output JSON:" >&2
+        cat "$temp_file" | jq '.'
+
+        # Write snapshot to trusted artifact directory
+        mkdir -p /var/workdir/snapshot
+        cp "$temp_file" /var/workdir/snapshot/snapshot.json
+        echo "Snapshot written to /var/workdir/snapshot/snapshot.json" >&2
+
+        # Output fallback warnings
+        if [[ -s "$FALLBACK_WARNINGS_FILE" ]]; then
+          cat "$FALLBACK_WARNINGS_FILE" > "$(results.fallback-warning.path)"
+        else
+          echo "" > "$(results.fallback-warning.path)"
+        fi
+
+        # Output component table
+        cat "$COMPONENT_TABLE_FILE" > "$(results.component-table.path)"
+
+        # Cleanup
+        rm -f "$temp_file" "$FALLBACK_WARNINGS_FILE" "$COMPONENT_TABLE_FILE"
+
+    - name: create-trusted-artifact
+      image: quay.io/redhat-appstudio/build-trusted-artifacts:latest@sha256:81c4864dae6bb11595f657be887e205262e70086a05ed16ada827fd6391926ac
+      args:
+      - create
+      - --store
+      - $(params.ociStorage)
+      - $(results.SNAPSHOT_ARTIFACT.path)=/var/workdir/snapshot
+      env:
+      - name: IMAGE_EXPIRES_AFTER
+        value: $(params.ociArtifactExpiresAfter)
