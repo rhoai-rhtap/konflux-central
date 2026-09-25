@@ -117,10 +117,6 @@ spec:
     default: 'custom-activation-key'
     type: string
     description: The name of the Kubernetes secret containing org and activationkey for RHEL subscription (used by prefetch-dependencies and buildah for hermetic RPM fetch and builds). See https://konflux-ci.dev/docs/building/activation-keys-subscription/
-  - default: 'false'
-    description: Disable all slack notifications
-    name: disable-slack-notifications
-    type: string
   - name: fips-check-blocking
     default: "true"
     type: string
@@ -768,37 +764,29 @@ spec:
         image: quay.io/rhoai-konflux/alpine:latest
         script: |
           echo "Success"
-  finally:
-  - name: send-slack-notification
-    params:
-    - name: message
-      value: "$(tasks.rhoai-init.results.slack-message-failure-text)"
-    - name: secret-name
-      value: rhoai-konflux-secret
-    - name: key-name
-      value: slack-webhook
-    taskRef:
-      params:
-      - name: name
-        value: slack-webhook-notification
-      - name: bundle
-        value: quay.io/konflux-ci/tekton-catalog/task-slack-webhook-notification:0.1@sha256:02842e9c752056c47a409f69ed462cfd38cbd6b15facb796564a610b549222ea
-      - name: kind
-        value: task
-      resolver: bundles
-    when:
-    - input: $(tasks.pipeline-success-indicator.status)
-      operator: notin
-      values:
-      - "Succeeded"
-    - input: $(tasks.rhoai-init.results.skip-slack-message)
-      operator: in
-      values:
-      - "false"
-    - input: $(params.disable-slack-notifications)
-      operator: notin
-      values:
-      - "true"
+  # There is deliberately no finally: send-slack-notification here, unlike the
+  # release copy of this pipeline in red-hat-data-services/konflux-central.
+  #
+  # That task posts to the RHOAI release channel through
+  # rhoai-konflux-secret/slack-webhook, and its three when: conditions are all
+  # satisfied by a failing early-gate build:
+  #
+  #   pipeline-success-indicator != Succeeded   - true, the build failed
+  #   rhoai-init.skip-slack-message == "false"  - true; rhoai-init only sets
+  #       this to "true" when expected-cluster is set AND does not match the
+  #       cluster in BUILD_URL.  The EG PipelineRun passes no expected-cluster,
+  #       so the guard is inert and the result is always "false".
+  #   disable-slack-notifications != "true"     - true, it defaults to "false"
+  #
+  # So every failed early-gate build paged the release team.  An EG build is a
+  # throwaway validation of an ephemeral branch that is deleted minutes later;
+  # nobody on that channel can act on it.
+  #
+  # Removed rather than switched off with disable-slack-notifications: "true",
+  # because that relies on every future caller of this pipeline remembering to
+  # pass it, and the failure mode of forgetting is a page to another team.
+  # pipeline-success-indicator stays - it is the pipeline's "everything passed"
+  # marker and is worth keeping visible even with nothing reading its status.
   workspaces:
   - name: git-auth
     optional: true
