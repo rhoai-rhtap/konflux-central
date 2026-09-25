@@ -753,12 +753,19 @@ spec:
             RESP=$(curl -sS -H "Authorization: token ${TOKEN}" \
               -H "Accept: application/vnd.github+json" "${CHECKS_URL}")
 
-            # PaC prefixes the check-run name with the PipelineRun name, so match
-            # on prefix rather than equality - the suffix varies per run.
+            # PaC reports the check-run under the Konflux provider name, not the
+            # bare PipelineRun name: an actual run of
+            # rhods-operator-gap-eg-push.yaml came back as
+            #
+            #   Konflux Production Internal / rhods-operator-gap-eg-on-push
+            #
+            # so the PipelineRun name is a substring, not a prefix.  Matching on
+            # prefix never fires, and this task would spin until timeout-minutes
+            # while the build it is watching has already finished.
             STATUS=$(jq -r --arg c "${CHECK}" \
-              '[.check_runs[] | select(.name | startswith($c))] | sort_by(.started_at) | last | .status // ""' <<< "${RESP}")
+              '[.check_runs[] | select(.name | contains($c))] | sort_by(.started_at) | last | .status // ""' <<< "${RESP}")
             CONCLUSION=$(jq -r --arg c "${CHECK}" \
-              '[.check_runs[] | select(.name | startswith($c))] | sort_by(.started_at) | last | .conclusion // ""' <<< "${RESP}")
+              '[.check_runs[] | select(.name | contains($c))] | sort_by(.started_at) | last | .conclusion // ""' <<< "${RESP}")
 
             if [ "${STATUS}" = "completed" ]; then
               echo "EG build check-run '${CHECK}' concluded: ${CONCLUSION}"
