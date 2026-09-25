@@ -32,15 +32,11 @@ spec:
     Block 2 (bundle) and Block 3 (FBC) are intentionally out of scope for now.
 
   params:
-  # --- General ---
-  - name: expected-cluster
-    type: string
-    default: ""
-    description: The cluster this pipeline is expected to run on
-  - name: pipeline-type
-    type: string
-    default: "pull-request"
-    description: Type of pipeline execution (push or pull-request)
+  # expected-cluster and pipeline-type used to live here.  They only ever fed
+  # rhoai-init, which this pipeline no longer runs (see the note above the
+  # tasks list), so they are gone rather than left declared and unread.
+  # Callers that still pass them are unaffected: Tekton ignores a PipelineRun
+  # param the Pipeline does not declare.
 
   # --- Leader PR ---
   - name: leader-pr-repo
@@ -72,6 +68,33 @@ spec:
     description: |
       Expiry for throwaway OCI artifacts (e.g. 1h, 2d, 3w).  Used for the
       group snapshot trusted artifact.
+  - name: enable-group-snapshot
+    type: string
+    default: "false"
+    description: |
+      Whether to run the group-snapshot block (resolve-group-configuration,
+      generate-snapshot, audit-snapshot).
+
+      Off by default because the block cannot yet complete against RHOAI.
+      Two preconditions are unmet:
+
+        1. generate-snapshot resolves each component digest through the
+           anonymous Quay API.  That works upstream because
+           quay.io/opendatahub is public; quay.io/rhoai is not - every
+           request comes back {"error_type": "invalid_token"}, so the
+           digest and the git.url/git.commit labels come back empty and
+           the task exits 1.  Enabling this needs a Quay pull credential
+           wired into the task.
+
+        2. resolve-group-configuration looks the leader repo up in
+           config/component_repo_map.json.  The leader is
+           red-hat-data-services/gated-artifacts-promoter, which is not a
+           built component and so is deliberately absent from that map.
+
+      The orchestration block downstream (check-leader-pr onward) has no
+      result dependency on the snapshot, only an ordering one, so it runs
+      normally when this is off - Tekton propagates skips through result
+      references, not through runAfter.
   - name: build-check-name
     type: string
     default: "rhods-operator-gap-eg-on-push"
@@ -107,29 +130,27 @@ spec:
   # Init block (runs once for the entire pipeline)
   # --------------------------------------------------------------------------
 
-  - name: rhoai-init
-    params:
-    - name: expected-cluster
-      value: $(params.expected-cluster)
-    - name: pipeline-type
-      value: $(params.pipeline-type)
-    taskRef:
-      resolver: git
-      params:
-      - name: url
-        value: https://github.com/red-hat-data-services/rhoai-konflux-tasks.git
-      - name: revision
-        value: odh
-      - name: pathInRepo
-        value: konflux-tekton-tasks/rhoai-init/0.3/rhoai-init.yaml
+  # There is deliberately no rhoai-init here.  It is the RHOAI build-metadata
+  # task: it derives the CPE id, the mandatory and unique image tags and the
+  # Slack failure text for a component build.  This pipeline builds nothing -
+  # the build is the PaC run on the ephemeral branch, which has its own
+  # rhoai-init - and nothing here consumed any of those results.
+  #
+  # It also could not run.  rhoai-init/0.3 mounts three configMapKeyRefs on a
+  # 'slack-config' ConfigMap without optional: true, and rhoai-tenant has no
+  # such ConfigMap, so the step never got as far as starting:
+  #
+  #   CreateContainerConfigError: configmap "slack-config" not found
+  #
+  # (The build pipeline dodges this by pinning rhoai-init/0.1, which reads
+  # rhoai-konflux-secret instead.  Following it there would mean carrying a
+  # required rhoai-version through a pipeline that has no image to label.)
 
   # Kept for parity with the upstream structure.  Its `build` result is not
   # consumed here, because the container build no longer runs in this pipeline
   # - it runs in the PaC-triggered PipelineRun that monitor-operator-build
   # watches, and that run does its own init.
   - name: init
-    runAfter:
-    - rhoai-init
     params:
     - name: image-url
       value: $(params.operator-output-image)
@@ -159,6 +180,10 @@ spec:
   - name: resolve-group-configuration
     runAfter:
     - init
+    when:
+    - input: $(params.enable-group-snapshot)
+      operator: in
+      values: ["true"]
     params:
     - name: leader-pr-repo
       value: $(params.leader-pr-repo)
@@ -184,6 +209,10 @@ spec:
   - name: generate-snapshot
     runAfter:
     - resolve-group-configuration
+    when:
+    - input: $(params.enable-group-snapshot)
+      operator: in
+      values: ["true"]
     params:
     - name: COMPONENTS
       value: $(tasks.resolve-group-configuration.results.group-components)
