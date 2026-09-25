@@ -328,9 +328,22 @@ spec:
   # Block 1: Operator build (orchestrated, not performed here)
   # --------------------------------------------------------------------------
 
+  # runAfter is init, not audit-snapshot.  A when: expression skips not only
+  # the task it guards but every task that depends on it - ordering
+  # dependencies through runAfter included, not just result references.  So
+  # while this ordered itself after audit-snapshot, turning the snapshot block
+  # off with enable-group-snapshot=false skipped the whole orchestration
+  # behind it, and the PipelineRun then reported success having done nothing:
+  #
+  #   * init                       15s  Succeeded
+  #   * cleanup-ephemeral-branch    5s  Succeeded
+  #   (check-leader-pr onward: skipped)
+  #
+  # Nothing here consumes a snapshot result, so there is no reason to wait for
+  # one either way: the two blocks are independent and now run in parallel.
   - name: check-leader-pr
     runAfter:
-    - audit-snapshot
+    - init
     params:
     - name: leader-pr-repo
       value: $(params.leader-pr-repo)
