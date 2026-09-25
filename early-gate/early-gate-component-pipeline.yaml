@@ -32,15 +32,11 @@ spec:
     Block 2 (bundle) and Block 3 (FBC) are intentionally out of scope for now.
 
   params:
-  # --- General ---
-  - name: expected-cluster
-    type: string
-    default: ""
-    description: The cluster this pipeline is expected to run on
-  - name: pipeline-type
-    type: string
-    default: "pull-request"
-    description: Type of pipeline execution (push or pull-request)
+  # expected-cluster and pipeline-type used to live here.  They only ever fed
+  # rhoai-init, which this pipeline no longer runs (see the note above the
+  # tasks list), so they are gone rather than left declared and unread.
+  # Callers that still pass them are unaffected: Tekton ignores a PipelineRun
+  # param the Pipeline does not declare.
 
   # --- Leader PR ---
   - name: leader-pr-repo
@@ -134,29 +130,27 @@ spec:
   # Init block (runs once for the entire pipeline)
   # --------------------------------------------------------------------------
 
-  - name: rhoai-init
-    params:
-    - name: expected-cluster
-      value: $(params.expected-cluster)
-    - name: pipeline-type
-      value: $(params.pipeline-type)
-    taskRef:
-      resolver: git
-      params:
-      - name: url
-        value: https://github.com/red-hat-data-services/rhoai-konflux-tasks.git
-      - name: revision
-        value: odh
-      - name: pathInRepo
-        value: konflux-tekton-tasks/rhoai-init/0.3/rhoai-init.yaml
+  # There is deliberately no rhoai-init here.  It is the RHOAI build-metadata
+  # task: it derives the CPE id, the mandatory and unique image tags and the
+  # Slack failure text for a component build.  This pipeline builds nothing -
+  # the build is the PaC run on the ephemeral branch, which has its own
+  # rhoai-init - and nothing here consumed any of those results.
+  #
+  # It also could not run.  rhoai-init/0.3 mounts three configMapKeyRefs on a
+  # 'slack-config' ConfigMap without optional: true, and rhoai-tenant has no
+  # such ConfigMap, so the step never got as far as starting:
+  #
+  #   CreateContainerConfigError: configmap "slack-config" not found
+  #
+  # (The build pipeline dodges this by pinning rhoai-init/0.1, which reads
+  # rhoai-konflux-secret instead.  Following it there would mean carrying a
+  # required rhoai-version through a pipeline that has no image to label.)
 
   # Kept for parity with the upstream structure.  Its `build` result is not
   # consumed here, because the container build no longer runs in this pipeline
   # - it runs in the PaC-triggered PipelineRun that monitor-operator-build
   # watches, and that run does its own init.
   - name: init
-    runAfter:
-    - rhoai-init
     params:
     - name: image-url
       value: $(params.operator-output-image)
