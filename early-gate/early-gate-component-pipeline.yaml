@@ -795,12 +795,15 @@ spec:
             RESP=$(curl -sS -H "Authorization: token ${TOKEN}" \
               -H "Accept: application/vnd.github+json" "${CHECKS_URL}")
 
-            # PaC prefixes the check-run name with the PipelineRun name, so match
-            # on prefix rather than equality - the suffix varies per run.
+            # The PipelineRun name is a substring of the check-run name, not a
+            # prefix of it.  PaC reports as
+            #   "Konflux Production Internal / rhods-operator-gap-eg-on-push"
+            # so startswith() never matches and the loop runs to its full
+            # timeout even once the build has gone green.
             STATUS=$(jq -r --arg c "${CHECK}" \
-              '[.check_runs[] | select(.name | startswith($c))] | sort_by(.started_at) | last | .status // ""' <<< "${RESP}")
+              '[.check_runs[] | select(.name | contains($c))] | sort_by(.started_at) | last | .status // ""' <<< "${RESP}")
             CONCLUSION=$(jq -r --arg c "${CHECK}" \
-              '[.check_runs[] | select(.name | startswith($c))] | sort_by(.started_at) | last | .conclusion // ""' <<< "${RESP}")
+              '[.check_runs[] | select(.name | contains($c))] | sort_by(.started_at) | last | .conclusion // ""' <<< "${RESP}")
 
             if [ "${STATUS}" = "completed" ]; then
               echo "EG build check-run '${CHECK}' concluded: ${CONCLUSION}"
@@ -830,8 +833,10 @@ spec:
 
   # fork-operator-branch always creates a branch, so something must always
   # remove it - otherwise every run leaves an orphan behind.  Deleting it is
-  # safe because the build tags the image eg-<branch>-<sha> as well as by
-  # commit, and neither tag depends on the ref still existing.
+  # safe because the build tags the image by commit - eg-<sha> - and that tag
+  # does not depend on the ref still existing.  That commit tag is the only one
+  # pushed; an earlier version of this comment also claimed an eg-<branch>-<sha>
+  # tag, which does not exist.
   - name: cleanup-ephemeral-branch
     params:
     - name: repo
