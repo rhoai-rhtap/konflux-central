@@ -96,6 +96,21 @@ spec:
         set -e
         cat /etc/*release
 
+        # The basic-auth workspace carries the RHOAI Quay read-only robot
+        # credential; quay.io/rhoai is private.  It stays optional, so a group
+        # made up entirely of public repos still resolves without it.
+        SKOPEO_AUTH=""
+        if [[ "${WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND}" == "true" ]]; then
+          AUTHFILE="${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.dockerconfigjson"
+          if [[ -f "${AUTHFILE}" ]]; then
+            SKOPEO_AUTH="--authfile ${AUTHFILE}"
+            echo "Using Quay credentials from the basic-auth workspace" >&2
+          else
+            echo "WARNING: basic-auth workspace is bound but ${AUTHFILE} is absent;" >&2
+            echo "         private repositories will fail to resolve." >&2
+          fi
+        fi
+
         # --- Leader PR parameters win over the PaC labels ---
         # See the task description: this pipeline is not PaC-triggered, so the
         # fieldRefs above resolve to the empty string.
@@ -166,7 +181,7 @@ spec:
 
             # Check if PR-specific image exists
             IMAGE_STATUS=""
-            if skopeo inspect "docker://quay.io/${repo_path}:${TAG}" &>/dev/null; then
+            if skopeo inspect ${SKOPEO_AUTH} "docker://quay.io/${repo_path}:${TAG}" &>/dev/null; then
               echo "✓ Found image with tag ${TAG}"
               IMAGE_STATUS="ready"
             else
@@ -192,83 +207,37 @@ spec:
             echo "Processing component: $component" >&2
             echo "Repository: $full_repo" >&2
 
-            # Extract namespace and repository name from repo_path
-            # Format: namespace/project/repository
-            namespace=${repo_path%/*}
-            repository=${repo_path##*/}
-
-            # Query Quay API to get the digest for the tag
-            api_url="https://quay.io/api/v1/repository/${namespace}/${repository}/tag/?specificTag=${TAG}"
-
-            echo "Querying: $api_url" >&2
-
-            # Make API request and extract the manifest digest
-            response=$(curl -s "$api_url")
-
-            # Get the latest (first) tag's manifest digest
-            manifest_digest=$(echo "$response" | jq -r '.tags[0].manifest_digest // empty')
-
-            if [ -z "$manifest_digest" ]; then
-                echo "Warning: No digest found for $component with tag $TAG" >&2
+            # One authenticated skopeo inspect yields everything the snapshot
+            # records: the manifest-list digest and the git.url/git.commit
+            # labels.  This replaces a chain of quay.io/api/v1 calls, which
+            # could never work here - that is Quay's REST API and it requires
+            # an OAuth 2 application token, rejecting the robot pull
+            # credentials this task is handed.  The registry v2 API skopeo
+            # speaks accepts them.
+            #
+            # --override-arch/--override-os choose which child of a manifest
+            # list supplies .Labels.  .Digest remains the list digest, which
+            # is the one the snapshot must reference.
+            if ! META=$(skopeo inspect ${SKOPEO_AUTH} --no-tags \
+                          --override-arch amd64 --override-os linux \
+                          "docker://${full_repo}:${TAG}" 2>&1); then
+                echo "Warning: could not inspect ${full_repo}:${TAG}" >&2
+                echo "${META}" >&2
+                manifest_digest=""
                 full_image_uri="${full_repo}:${TAG}"
                 git_url=""
                 git_commit=""
             else
-                echo "Found digest: $manifest_digest" >&2
-                full_image_uri="${full_repo}@${manifest_digest}"
+                manifest_digest=$(jq -r '.Digest // empty' <<< "${META}")
+                git_url=$(jq -r '.Labels["git.url"] // empty' <<< "${META}")
+                git_commit=$(jq -r '.Labels["git.commit"] // empty' <<< "${META}")
 
-                # Query Quay API to get the manifest details and extract labels
-                manifest_api_url="https://quay.io/api/v1/repository/${namespace}/${repository}/manifest/${manifest_digest}"
-                echo "Querying manifest: $manifest_api_url" >&2
-
-                manifest_response=$(curl -s "$manifest_api_url")
-                echo "manifest_response=${manifest_response}" >&2
-
-                # Check if this is a manifest list (multi-arch image)
-                is_manifest_list=$(echo "$manifest_response" | jq -r '.is_manifest_list // false')
-                echo "Is manifest list: $is_manifest_list" >&2
-
-                if [ "$is_manifest_list" = "true" ]; then
-                    echo "Multi-arch image detected, extracting first manifest digest" >&2
-
-                    # Get the digest of the first manifest in the list
-                    first_manifest_digest=$(echo "$manifest_response" | jq -r '.manifest_data' | jq -r '.manifests[0].digest // empty')
-
-                    if [ -z "$first_manifest_digest" ]; then
-                        echo "Warning: No manifest found in manifest list" >&2
-                        git_url=""
-                        git_commit=""
-                    else
-                        echo "First manifest digest: $first_manifest_digest" >&2
-
-                        # Fetch the child manifest and resolve its config blob. Quay's
-                        # /labels endpoint does not expose OCI config labels for child
-                        # manifests in a multi-arch image.
-                        specific_manifest_api_url="https://quay.io/api/v1/repository/${namespace}/${repository}/manifest/${first_manifest_digest}"
-                        echo "Querying specific manifest: $specific_manifest_api_url" >&2
-
-                        specific_manifest_response=$(curl -fsS "$specific_manifest_api_url")
-                        echo "specific_manifest_response=${specific_manifest_response}"
-                        config_digest=$(echo "$specific_manifest_response" | jq -r '.manifest_data' | jq -r '.config.digest // empty')
-
-                        if [ -z "$config_digest" ]; then
-                            echo "Warning: No config found for child manifest $first_manifest_digest" >&2
-                            git_url=""
-                            git_commit=""
-                        else
-                            config_api_url="https://quay.io/v2/${namespace}/${repository}/blobs/${config_digest}"
-                            echo "Querying image config: $config_api_url" >&2
-                            config_response=$(curl -fsSL "$config_api_url")
-                            git_url=$(echo "$config_response" | jq -r '.config.Labels["git.url"] // empty')
-                            git_commit=$(echo "$config_response" | jq -r '.config.Labels["git.commit"] // empty')
-                        fi
-                    fi
+                if [ -z "${manifest_digest}" ]; then
+                    echo "Warning: No digest found for $component with tag $TAG" >&2
+                    full_image_uri="${full_repo}:${TAG}"
                 else
-                    echo "Single-arch image, extracting labels directly" >&2
-
-                    # Extract git.url and git.commit labels from current manifest
-                    git_url=$(echo "$manifest_response" | jq -r '.config.config.Labels["git.url"] // empty')
-                    git_commit=$(echo "$manifest_response" | jq -r '.config.config.Labels["git.commit"] // empty')
+                    echo "Found digest: $manifest_digest" >&2
+                    full_image_uri="${full_repo}@${manifest_digest}"
                 fi
 
                 echo "Git URL: $git_url" >&2

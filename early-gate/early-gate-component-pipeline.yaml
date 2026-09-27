@@ -123,6 +123,14 @@ spec:
   workspaces:
   - name: github-credentials
     description: Secret workspace holding a 'token' key with a GitHub API token
+  - name: quay-credentials
+    optional: true
+    description: |
+      dockerconfigjson secret for the RHOAI Quay read-only robot, used by
+      generate-snapshot to resolve component digests and git labels.
+      quay.io/rhoai is private, so without it only public components resolve.
+      Optional so the orchestration path, which pulls nothing, needs no
+      registry credential at all.
 
   tasks:
 
@@ -190,6 +198,10 @@ spec:
     - name: leader-pr-number
       value: $(params.leader-pr-number)
     workspaces:
+    # basic-auth here is a GitHub token, not a registry credential: this
+    # task reads token/.git-credentials/.github-token out of it to call the
+    # GitHub API.  generate-snapshot reuses the same workspace name for a
+    # Quay dockerconfigjson - same name, different credential.
     - name: basic-auth
       workspace: github-credentials
     taskRef:
@@ -226,7 +238,7 @@ spec:
       value: $(params.image-expires-after)
     workspaces:
     - name: basic-auth
-      workspace: github-credentials
+      workspace: quay-credentials
     taskRef:
       resolver: git
       params:
