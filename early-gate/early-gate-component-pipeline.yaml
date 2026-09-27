@@ -252,7 +252,18 @@ spec:
     - name: leader-pr-number
       value: $(params.leader-pr-number)
     - name: ociStorage
-      value: $(params.operator-output-image).snapshot
+    # Upstream writes $(params.operator-output-image).snapshot, which works
+    # there because its operator-output-image carries a tag
+    # (quay.io/opendatahub/opendatahub-operator:odh-pr), so the suffix lands
+    # on the tag and the artifact stays in the same repository.  Ours is a
+    # bare repository - monitor-operator-build appends :eg-<sha> itself - so
+    # the same expression suffixed the *repository* instead and pushed to
+    # rhods-operator-gap.snapshot, which does not exist and which the build
+    # service account cannot create.  The tag is therefore explicit here.
+    #
+    # This was invisible until now: enable-group-snapshot defaulted to
+    # "false", so this task had never actually run.
+      value: $(params.operator-output-image):eg-$(params.leader-pr-number).snapshot
     - name: ociArtifactExpiresAfter
       value: $(params.image-expires-after)
     workspaces:
