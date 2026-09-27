@@ -16,20 +16,35 @@ spec:
 
     The sequence is:
 
-      resolve-group-...      read the leader PR, expand it into a component set
+      resolve-group-...      read the leader PR once: expand it into a
+                             component set AND decide main vs stable
       generate-snapshot      pin each of those components to a quay digest
       audit-snapshot         log the snapshot, flag whether it has the operator
-      check-leader-pr        read the leader PR, decide main vs stable
       fork-operator-branch   always create eg-<leader-pr-number>
       trigger-operator-...   dispatch operator-processor, return the run id
       monitor-operator-...   wait for it, read back the commit it pushed
-      monitor-operator-build wait for the PaC build that commit triggered
+      monitor-operator-build wait for the PaC build, resolve the image digest
+
+    This used to be two parallel chains.  A separate check-leader-pr task read
+    the same leader PR a second time purely to decide the fork source, and the
+    snapshot block sat behind an enable-group-snapshot flag because it could
+    not complete.  Both are gone: the leader PR is parsed once, in
+    resolve-group-configuration, and the snapshot block always runs.
+
+    What made that safe is that resolve-group-configuration no longer fails on
+    a leader PR it cannot fully resolve - it writes every result on every path
+    and returns an empty component group rather than exiting 1 - and
+    generate-snapshot omits a component it cannot resolve instead of failing.
+    A single entry point is only an improvement if it cannot become a single
+    point of failure.
 
     Nothing is ever pushed to main or stable.  Every write goes to the
     ephemeral branch, which the finally task deletes once the image carries a
     durable tag.
 
-    Block 2 (bundle) and Block 3 (FBC) are intentionally out of scope for now.
+    Block 2 (bundle) and Block 3 (FBC) are intentionally out of scope, but
+    OPERATOR_IMAGE_URL/OPERATOR_IMAGE_DIGEST are published as pipeline results
+    so they have something to consume when they arrive.
 
   params:
   # expected-cluster and pipeline-type used to live here.  They only ever fed
@@ -68,39 +83,31 @@ spec:
     description: |
       Expiry for throwaway OCI artifacts (e.g. 1h, 2d, 3w).  Used for the
       group snapshot trusted artifact.
-  - name: enable-group-snapshot
-    type: string
-    default: "false"
-    description: |
-      Whether to run the group-snapshot block (resolve-group-configuration,
-      generate-snapshot, audit-snapshot).
-
-      Off by default because the block cannot yet complete against RHOAI.
-      Two preconditions are unmet:
-
-        1. generate-snapshot resolves each component digest through the
-           anonymous Quay API.  That works upstream because
-           quay.io/opendatahub is public; quay.io/rhoai is not - every
-           request comes back {"error_type": "invalid_token"}, so the
-           digest and the git.url/git.commit labels come back empty and
-           the task exits 1.  Enabling this needs a Quay pull credential
-           wired into the task.
-
-        2. resolve-group-configuration looks the leader repo up in
-           config/component_repo_map.json.  The leader is
-           red-hat-data-services/gated-artifacts-promoter, which is not a
-           built component and so is deliberately absent from that map.
-
-      The orchestration block downstream (check-leader-pr onward) has no
-      result dependency on the snapshot, only an ordering one, so it runs
-      normally when this is off - Tekton propagates skips through result
-      references, not through runAfter.
+  # enable-group-snapshot used to live here, defaulting to "false", because
+  # the snapshot block could not complete: generate-snapshot resolved digests
+  # through the anonymous Quay API against a private quay.io/rhoai, and
+  # resolve-group-configuration exited 1 when the leader repo was absent from
+  # component_repo_map.json.  Both are fixed - the snapshot authenticates with
+  # a read-only robot, and an unresolvable leader repo now yields an empty
+  # group - so the block runs unconditionally and the flag is gone.
   - name: build-check-name
     type: string
     default: "rhods-operator-gap-eg-on-push"
     description: |
       Name of the PaC check-run to watch.  Must match the PipelineRun name in
       rhods-operator-gap-eg-push.yaml, since that is what PaC reports as.
+
+  # --- Self-reference ---
+  - name: konflux-central-revision
+    type: string
+    default: "main"
+    description: |
+      Revision of this repository the task definitions below are resolved
+      from.  It exists so a change to this pipeline can be exercised before
+      it is merged: the PipelineRun that invokes it pins pipelineRef.revision
+      to a branch, and without this the pipeline body would come from that
+      branch while its tasks still came from main.  Leave it at main for
+      anything other than a test run of an unmerged branch.
 
   # --- Timeouts ---
   - name: processor-timeout-minutes
@@ -117,6 +124,19 @@ spec:
     value: $(tasks.monitor-operator-processor.results.processor-commit)
   - name: OPERATOR_IMAGE_URL
     value: $(tasks.monitor-operator-build.results.image-ref)
+  # The digest, not just the tag.  A bundle references the operator by digest,
+  # and the eg-<sha> tag is mutable in principle - it is re-pushed if the same
+  # commit is rebuilt - so the tag alone is not a durable handle.
+  - name: OPERATOR_IMAGE_DIGEST
+    value: $(tasks.monitor-operator-build.results.image-digest)
+  # Published alongside the bare digest so a consumer does not have to
+  # reassemble repo@digest from two results and get the separator wrong.
+  - name: OPERATOR_IMAGE_REF_BY_DIGEST
+    value: $(tasks.monitor-operator-build.results.image-ref-by-digest)
+  - name: OMITTED_COMPONENTS
+    value: $(tasks.generate-snapshot.results.omitted-components)
+  - name: SNAPSHOT_ARTIFACT
+    value: $(tasks.generate-snapshot.results.SNAPSHOT_ARTIFACT)
   - name: BUILD_STATUS
     value: $(tasks.monitor-operator-build.results.build-status)
 
@@ -188,15 +208,18 @@ spec:
   - name: resolve-group-configuration
     runAfter:
     - init
-    when:
-    - input: $(params.enable-group-snapshot)
-      operator: in
-      values: ["true"]
     params:
     - name: leader-pr-repo
       value: $(params.leader-pr-repo)
     - name: leader-pr-number
       value: $(params.leader-pr-number)
+    # The fork-source decision moved here from check-leader-pr, so this task
+    # needs to know which repo counts as the operator and where to fork from
+    # when the leader PR cannot be read at all.
+    - name: operator-repo-name
+      value: $(params.operator-repo)
+    - name: fallback-source-branch
+      value: $(params.fallback-source-branch)
     workspaces:
     # basic-auth here is a GitHub token, not a registry credential: this
     # task reads token/.git-credentials/.github-token out of it to call the
@@ -210,7 +233,7 @@ spec:
       - name: url
         value: https://github.com/rhoai-rhtap/konflux-central.git
       - name: revision
-        value: main
+        value: $(params.konflux-central-revision)
       - name: pathInRepo
         value: early-gate/tasks/resolve-group-configuration.yaml
 
@@ -221,10 +244,6 @@ spec:
   - name: generate-snapshot
     runAfter:
     - resolve-group-configuration
-    when:
-    - input: $(params.enable-group-snapshot)
-      operator: in
-      values: ["true"]
     params:
     - name: COMPONENTS
       value: $(tasks.resolve-group-configuration.results.group-components)
@@ -245,7 +264,7 @@ spec:
       - name: url
         value: https://github.com/rhoai-rhtap/konflux-central.git
       - name: revision
-        value: main
+        value: $(params.konflux-central-revision)
       - name: pathInRepo
         value: early-gate/tasks/generate-snapshot-for-group-testing.yaml
 
@@ -340,146 +359,22 @@ spec:
   # Block 1: Operator build (orchestrated, not performed here)
   # --------------------------------------------------------------------------
 
-  # runAfter is init, not audit-snapshot.  A when: expression skips not only
-  # the task it guards but every task that depends on it - ordering
-  # dependencies through runAfter included, not just result references.  So
-  # while this ordered itself after audit-snapshot, turning the snapshot block
-  # off with enable-group-snapshot=false skipped the whole orchestration
-  # behind it, and the PipelineRun then reported success having done nothing:
-  #
-  #   * init                       15s  Succeeded
-  #   * cleanup-ephemeral-branch    5s  Succeeded
-  #   (check-leader-pr onward: skipped)
-  #
-  # Nothing here consumes a snapshot result, so there is no reason to wait for
-  # one either way: the two blocks are independent and now run in parallel.
-  - name: check-leader-pr
-    runAfter:
-    - init
-    params:
-    - name: leader-pr-repo
-      value: $(params.leader-pr-repo)
-    - name: leader-pr-number
-      value: $(params.leader-pr-number)
-    - name: operator-repo-name
-      value: $(params.operator-repo)
-    - name: fallback-source-branch
-      value: $(params.fallback-source-branch)
-    workspaces:
-    - name: github-credentials
-      workspace: github-credentials
-    taskSpec:
-      description: |
-        Reads the leader PR and decides which branch the ephemeral branch is
-        forked from.  An operator PR in the leader means the operator source
-        itself is changing, so fork from main, where that PR lands; otherwise
-        the operator source is whatever is released, so fork from stable.
-      params:
-      - name: leader-pr-repo
-        type: string
-      - name: leader-pr-number
-        type: string
-      - name: operator-repo-name
-        type: string
-      - name: fallback-source-branch
-        type: string
-      results:
-      - name: source-branch
-        description: Branch to fork the ephemeral branch from - main or stable
-      - name: operator-pr-included
-        description: true when the leader PR lists a child PR against the operator repo
-      - name: component-count
-        description: Number of distinct repos the leader PR references
-      workspaces:
-      - name: github-credentials
-        description: Secret workspace holding a 'token' key
-      steps:
-      - name: check-pr
-        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
-        script: |
-          #!/bin/bash
-          set -euo pipefail
-
-          # One place that prints the decision, so every exit path - including
-          # the degraded ones - says out loud which branch was chosen and why.
-          # Without this the only clue in the logs is a branch name, and "eg-5
-          # forked from stable" does not tell you whether stable was chosen or
-          # merely fallen back to.
-          summarise() {
-            echo "----------------------------------------------------------"
-            echo " Leader PR         $(params.leader-pr-repo)#$(params.leader-pr-number)"
-            echo " Operator PR       $1"
-            echo " Fork source       $2"
-            echo " Reason            $3"
-            echo "----------------------------------------------------------"
-          }
-
-          # jq, rather than grep, because a PR body is free text: it contains
-          # escaped quotes and \n, which shear a grep/cut pipeline off at the
-          # first one and silently truncate the body we are about to search.
-          microdnf install -y jq >/dev/null
-
-          TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
-          REPO="$(params.leader-pr-repo)"
-          PR_NUM="$(params.leader-pr-number)"
-          OP_REPO="$(params.operator-repo-name)"
-
-          HTTP_CODE=$(curl -sS -o /tmp/pr.json -w "%{http_code}" \
-            -H "Authorization: token ${TOKEN}" \
-            "https://api.github.com/repos/${REPO}/pulls/${PR_NUM}")
-
-          # Degrade rather than fail.  A leader PR that cannot be read must not
-          # take the run down with it - fall back to the caller's branch, which
-          # still produces a valid, if less targeted, build.
-          if [ "${HTTP_CODE}" != "200" ]; then
-            echo "Could not read leader PR ${REPO}#${PR_NUM} (HTTP ${HTTP_CODE})" >&2
-            summarise "unknown" "$(params.fallback-source-branch)" \
-              "leader PR could not be read (HTTP ${HTTP_CODE}) - fell back to the caller's branch"
-            echo -n "$(params.fallback-source-branch)" > $(results.source-branch.path)
-            echo -n "false" > $(results.operator-pr-included.path)
-            echo -n "0" > $(results.component-count.path)
-            exit 0
-          fi
-
-          PR_BODY=$(jq -r '.body // ""' /tmp/pr.json)
-
-          # Every repo the leader PR references, deduplicated.  grep -c would
-          # count matching *lines*, and the body is frequently one line, so it
-          # would report 1 no matter how many repos were listed.
-          LISTED=$(printf '%s' "${PR_BODY}" \
-            | grep -oiE 'rhoai-rhtap/[A-Za-z0-9._-]+' | tr 'A-Z' 'a-z' | sort -u || true)
-          PR_COUNT=$(printf '%s' "${LISTED}" | grep -c . || true)
-          echo "Leader PR references ${PR_COUNT} repo(s):"
-          printf '%s\n' "${LISTED}"
-          echo -n "${PR_COUNT}" > $(results.component-count.path)
-
-          if printf '%s' "${LISTED}" | grep -qixF "${OP_REPO}"; then
-            # The operator itself is changing, so the ephemeral branch has to
-            # carry that change: fork from main, where the operator PR lands.
-            summarise "included" "main" \
-              "the leader PR changes the operator, so the ephemeral branch forks from main where that PR lands"
-            echo -n "main" > $(results.source-branch.path)
-            echo -n "true" > $(results.operator-pr-included.path)
-          else
-            # No operator change in flight, so the operator source is whatever
-            # is already released: fork from stable.
-            summarise "not included" "stable" \
-              "the leader PR changes ${PR_COUNT} component(s) but not the operator, so the operator is rebuilt from stable against them"
-            echo -n "stable" > $(results.source-branch.path)
-            echo -n "false" > $(results.operator-pr-included.path)
-          fi
+  # check-leader-pr used to sit here, between init and fork-operator-branch,
+  # reading the same leader PR a second time to decide the fork source.  That
+  # decision is now resolve-group-configuration's source-branch result, so the
+  # leader PR is read once and there is one chain instead of two.
 
   # Always runs.  There is deliberately no `when` guard and no path that writes
   # to main or stable: every change this pipeline makes lands on a branch that
   # exists only for the duration of the gate.
   - name: fork-operator-branch
     runAfter:
-    - check-leader-pr
+    - audit-snapshot
     params:
     - name: repo
       value: $(params.operator-repo)
     - name: source-branch
-      value: $(tasks.check-leader-pr.results.source-branch)
+      value: $(tasks.resolve-group-configuration.results.source-branch)
     - name: branch-name
       value: eg-$(params.leader-pr-number)
     workspaces:
@@ -624,9 +519,9 @@ spec:
     - name: branch-name
       value: $(tasks.fork-operator-branch.results.branch-name)
     - name: forked-from
-      value: $(tasks.check-leader-pr.results.source-branch)
+      value: $(tasks.resolve-group-configuration.results.source-branch)
     - name: operator-pr-included
-      value: $(tasks.check-leader-pr.results.operator-pr-included)
+      value: $(tasks.resolve-group-configuration.results.operator-pr-included)
     - name: previous-run-id
       value: $(tasks.trigger-operator-processor-on-ephemeral-branch.results.previous-run-id)
     - name: timeout-minutes
@@ -777,6 +672,14 @@ spec:
         description: success, failure, or timeout
       - name: image-ref
         description: Image the EG build produced, by commit
+      - name: image-digest
+        description: |
+          Manifest-list digest the eg-<sha> tag resolves to.  Empty if the
+          build did not succeed, or if the tag could not be read back.
+      - name: image-ref-by-digest
+        description: |
+          The same image pinned by digest - <repo>@sha256:... - which is the
+          form a bundle or FBC reference needs.  Empty when image-digest is.
       workspaces:
       - name: github-credentials
         description: Secret workspace holding a 'token' key
@@ -798,6 +701,51 @@ spec:
           # reference reported here is the one that was actually pushed.
           IMAGE_REF="$(params.output-image):eg-${SHA}"
           echo -n "${IMAGE_REF}" > $(results.image-ref.path)
+
+          # Written before anything can fail.  A declared result that never
+          # gets a value is an error in its own right, and every path out of
+          # this step below the success branch is an early exit.
+          echo -n "" > $(results.image-digest.path)
+          echo -n "" > $(results.image-ref-by-digest.path)
+
+          # Resolves the tag the build just pushed to the digest it points at.
+          # The check-run says the build is green; it does not say what came
+          # out of it, and a bundle references the operator by digest because
+          # eg-<sha> is mutable in principle - rebuilding the same commit
+          # re-pushes it.
+          #
+          # This needs no credential: quay.io's registry v2 API issues a pull
+          # token anonymously for this repository.  The /api/v1 REST API would
+          # not - that one wants an OAuth application token - which is why the
+          # digest is read from a manifest HEAD rather than a tag listing.
+          resolve_digest() {
+            local repo_path tag registry scope_repo token digest
+            repo_path="${IMAGE_REF%:*}"     # quay.io/<ns>/<repo>
+            tag="${IMAGE_REF##*:}"          # eg-<sha>
+            registry="${repo_path%%/*}"     # quay.io
+            scope_repo="${repo_path#*/}"    # <ns>/<repo>
+
+            token=$(curl -sS "https://${registry}/v2/auth?service=${registry}&scope=repository:${scope_repo}:pull" \
+                      | jq -r '.token // empty')
+            [ -n "${token}" ] || return 1
+
+            # The index media types have to be accepted explicitly.  The EG
+            # build is multi-arch - the tag points at a four-child manifest
+            # list - and a request that does not accept a list gets one child
+            # manifest back instead, whose digest is not what the tag
+            # resolves to.  The single-manifest types are accepted too, so
+            # this still works if the build ever stops being multi-arch.
+            digest=$(curl -sS -I -H "Authorization: Bearer ${token}" \
+                       -H "Accept: application/vnd.oci.image.index.v1+json" \
+                       -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+                       -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+                       -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+                       "https://${registry}/v2/${scope_repo}/manifests/${tag}" \
+                     | tr -d '\r' \
+                     | awk -F': ' 'tolower($1) == "docker-content-digest" { print $2 }')
+            [ -n "${digest}" ] || return 1
+            printf '%s' "${digest}"
+          }
 
           CHECKS_URL="https://api.github.com/repos/${REPO}/commits/${SHA}/check-runs?per_page=100"
 
@@ -822,6 +770,29 @@ spec:
               if [ "${CONCLUSION}" = "success" ]; then
                 echo "Image: ${IMAGE_REF}"
                 echo -n "success" > $(results.build-status.path)
+
+                # The tag can trail the check-run by a few seconds, so this
+                # retries rather than treating the first 404 as the answer.
+                DIGEST=""
+                for attempt in 1 2 3 4 5 6; do
+                  if DIGEST=$(resolve_digest); then
+                    break
+                  fi
+                  DIGEST=""
+                  echo "Tag eg-${SHA} not readable yet, retry ${attempt}/6..."
+                  sleep 10
+                done
+
+                if [ -n "${DIGEST}" ]; then
+                  echo "Digest: ${DIGEST}"
+                  echo -n "${DIGEST}" > $(results.image-digest.path)
+                  echo -n "${IMAGE_REF%:*}@${DIGEST}" > $(results.image-ref-by-digest.path)
+                else
+                  # Not fatal: the gate's question is whether the operator
+                  # builds, and it did.  Downstream gets an empty digest and
+                  # can decide for itself whether it can proceed without one.
+                  echo "WARNING: build succeeded but ${IMAGE_REF} did not resolve to a digest" >&2
+                fi
                 exit 0
               fi
               echo "EG build did not succeed (${CONCLUSION})" >&2
@@ -846,9 +817,9 @@ spec:
   # fork-operator-branch always creates a branch, so something must always
   # remove it - otherwise every run leaves an orphan behind.  Deleting it is
   # safe because the build tags the image by commit - eg-<sha> - and that tag
-  # does not depend on the ref still existing.  That commit tag is the only one
-  # pushed; an earlier version of this comment also claimed an eg-<branch>-<sha>
-  # tag, which does not exist.
+  # does not depend on the ref still existing.  rhods-operator-gap-eg-push.yaml
+  # also pushes eg-<leader-pr-number>-<sha> via additional-tags; both resolve to
+  # the same digest, and monitor-operator-build reads back the eg-<sha> one.
   - name: cleanup-ephemeral-branch
     params:
     - name: repo

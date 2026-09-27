@@ -10,9 +10,17 @@ spec:
     The digest-resolution logic is unchanged.  What differs is the component
     map it falls back to (rhoai-rhtap/konflux-central), the per-PR tag it
     looks for (rhoai-pr-<N> rather than odh-pr-<N>) and the tag it falls back
-    to when that PR image has not been published yet (rhoai-3.6, which is
-    what the RHOAI push pipelines tag as - their output-image is
-    quay.io/rhoai/<repo>:{{target_branch}}).
+    to when that PR image has not been published yet.
+
+    That fallback is rhoai-3.5, not rhoai-3.6, because rhoai-3.5 is what
+    operator-processor resolves against.  For an eg-* branch the processor
+    derives its release from the highest rhoai-X.Y branch in the operator
+    repo, and its ^[23]\.[0-9]+$ filter rejects rhoai-3.6-ea.1/ea.2 - the only
+    3.6 branches that exist - so it settles on rhoai-3.5.  Pinning the
+    snapshot to 3.6 would have it reference a different release from the one
+    the processor writes into operands-map.  Measured across the 72 repos in
+    the operator's operands-map, 66 carry a rhoai-3.5 tag and 58 carry a
+    rhoai-3.6 one.
 
     As with resolve-group-configuration, leader-pr-repo/leader-pr-number are
     accepted because the RHOAI early-gate pipeline is driven by the Leader PR
@@ -31,7 +39,7 @@ spec:
       default: ""
     - name: fallback-tag
       type: string
-      default: rhoai-3.6
+      default: rhoai-3.5
       description: Quay tag when PR image is missing
     - name: leader-pr-repo
       type: string
@@ -59,6 +67,8 @@ spec:
     name: fallback-warning
   - description: Component summary table for PR comment (TSV format - PR component tag status digest)
     name: component-table
+  - description: Components left out of the snapshot because no image could be resolved
+    name: omitted-components
   volumes:
   - name: workdir
     emptyDir: {}
@@ -138,6 +148,14 @@ spec:
           echo "Fetched COMPONENTS for ${REPO_NAME}: ${COMPONENTS}" >&2
         fi
 
+        # An empty or absent group is a legitimate outcome, not a failure:
+        # resolve-group-configuration returns {} when the leader repo owns no
+        # components.  Normalise it so the jq below has an object to walk.
+        if [[ -z "${COMPONENTS}" || "${COMPONENTS}" == "null" ]]; then
+          echo "No components to resolve - emitting an empty snapshot" >&2
+          COMPONENTS="{}"
+        fi
+
         echo -n "${COMPONENTS}" > "$(results.group-components.path)"
 
         json_string="$COMPONENTS"
@@ -150,8 +168,10 @@ spec:
         # Track fallback warnings and component table (use temp files to avoid subshell issues)
         FALLBACK_WARNINGS_FILE=$(mktemp)
         COMPONENT_TABLE_FILE=$(mktemp)
+        OMITTED_FILE=$(mktemp)
         > "$FALLBACK_WARNINGS_FILE"
         > "$COMPONENT_TABLE_FILE"
+        > "$OMITTED_FILE"
 
         DEFAULT_PR_NUMBER="${PR_NUMBER}"
 
@@ -244,9 +264,19 @@ spec:
                 echo "Git Commit: $git_commit" >&2
             fi
 
+            # A component whose image cannot be resolved is omitted from the
+            # snapshot rather than taking the run down.  Not every repo a
+            # leader PR references publishes to quay.io/rhoai on the fallback
+            # tag - fork repos in particular push to their own tenant
+            # namespaces - and one such entry must not cost the whole gate.
+            # The omission is recorded, so a snapshot that is quietly thinner
+            # than the group is visible rather than silent.
             if [ -z "$git_url" ] || [ -z "$git_commit" ]; then
-                echo "ERROR: Required git metadata is missing for $component" >&2
-                exit 1
+                echo "⚠️  WARNING: no resolvable image for ${component} (${full_repo}:${TAG})" >&2
+                echo "   Omitting it from the snapshot." >&2
+                echo "- \`${component}\` (\`${full_repo}:${TAG}\`): no image or no git.url/git.commit labels" >> "$OMITTED_FILE"
+                echo "" >&2
+                continue
             fi
 
             # Add to output JSON with image URI, git.url, and git.commit
@@ -289,8 +319,18 @@ spec:
         # Output component table
         cat "$COMPONENT_TABLE_FILE" > "$(results.component-table.path)"
 
+        # Output the components that could not be resolved
+        if [[ -s "$OMITTED_FILE" ]]; then
+          echo "" >&2
+          echo "⚠️  Components omitted from the snapshot:" >&2
+          cat "$OMITTED_FILE" >&2
+          cat "$OMITTED_FILE" > "$(results.omitted-components.path)"
+        else
+          echo -n "" > "$(results.omitted-components.path)"
+        fi
+
         # Cleanup
-        rm -f "$temp_file" "$FALLBACK_WARNINGS_FILE" "$COMPONENT_TABLE_FILE"
+        rm -f "$temp_file" "$FALLBACK_WARNINGS_FILE" "$COMPONENT_TABLE_FILE" "$OMITTED_FILE"
 
     - name: create-trusted-artifact
       image: quay.io/redhat-appstudio/build-trusted-artifacts:latest@sha256:81c4864dae6bb11595f657be887e205262e70086a05ed16ada827fd6391926ac

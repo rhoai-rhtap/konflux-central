@@ -18,6 +18,17 @@ spec:
     parameters, so leader-pr-repo/leader-pr-number are accepted and take
     precedence when set.  With both unset the task behaves exactly as
     upstream does.
+
+    A second addition, RHOAI-only: this task is now the pipeline's single
+    entry point.  It used to run alongside a separate check-leader-pr task
+    that read the same leader PR a second time purely to decide which branch
+    the ephemeral branch forks from.  That decision now lives here, as the
+    source-branch result, so the leader PR is parsed once.
+
+    Because fork-operator-branch depends on that result, this task can no
+    longer be allowed to fail on a leader PR the snapshot block cannot use.
+    Every exit path writes every result, and a leader repo that owns no
+    components resolves to an empty group rather than exiting 1.
   workspaces:
     - name: basic-auth
       optional: true
@@ -32,6 +43,16 @@ spec:
       type: string
       default: ""
       description: Leader PR number.  Overrides the PaC label when set.
+    - name: operator-repo-name
+      type: string
+      default: "rhoai-rhtap/rhods-operator-gap"
+      description: |
+        org/repo of the operator.  When the leader PR references it, the
+        operator source is itself changing and source-branch resolves to main.
+    - name: fallback-source-branch
+      type: string
+      default: "stable"
+      description: Branch to fork from when the leader PR cannot be read
   results:
     - name: group-components
       description: Resolved components JSON with PR metadata for group testing
@@ -41,6 +62,12 @@ spec:
       description: Warning messages for repos not found in component_repo_map.json
     - name: format-help-warning
       description: Helpful message when earlygate is mentioned incorrectly or PR URLs found outside section
+    - name: source-branch
+      description: Branch to fork the ephemeral branch from - main or stable
+    - name: operator-pr-included
+      description: true when the leader PR references the operator repo
+    - name: component-count
+      description: Number of distinct rhoai-rhtap repos the leader PR references
   volumes:
     - name: workdir
       emptyDir: {}
@@ -67,6 +94,10 @@ spec:
           value: $(params.leader-pr-repo)
         - name: LEADER_PR_NUMBER
           value: $(params.leader-pr-number)
+        - name: OPERATOR_REPO_NAME
+          value: $(params.operator-repo-name)
+        - name: FALLBACK_SOURCE_BRANCH
+          value: $(params.fallback-source-branch)
         - name: WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND
           value: $(workspaces.basic-auth.bound)
         - name: WORKSPACE_BASIC_AUTH_DIRECTORY_PATH
@@ -74,6 +105,54 @@ spec:
       script: |
         #!/bin/bash
         set -e
+
+        # --- Every result gets a value before anything can fail ---
+        # This task gates fork-operator-branch now, so an unwritten result is
+        # not a degraded snapshot, it is a dead pipeline.  Writing defaults
+        # first means every subsequent path - including the ones that give up
+        # early - leaves a complete, readable set of results behind.
+        echo -n "{}"                        > "$(results.group-components.path)"
+        echo -n "false"                     > "$(results.has-group-config.path)"
+        echo -n ""                          > "$(results.invalid-repo-warnings.path)"
+        echo -n ""                          > "$(results.format-help-warning.path)"
+        echo -n "${FALLBACK_SOURCE_BRANCH}" > "$(results.source-branch.path)"
+        echo -n "false"                     > "$(results.operator-pr-included.path)"
+        echo -n "0"                         > "$(results.component-count.path)"
+
+        # Decides which branch the ephemeral branch is forked from, and records
+        # it.  An operator PR in the leader means the operator source itself is
+        # changing, so fork from main, where that PR lands; otherwise the
+        # operator source is whatever is released, so fork from stable.
+        #
+        # This scans the whole PR body rather than the Early Gate section: the
+        # fork decision must hold even for a leader PR whose body has no
+        # section this task can parse, which is precisely the case the separate
+        # check-leader-pr task used to cover.
+        decide_fork_source() {
+          local body="$1"
+          local op_repo listed count
+          op_repo=$(echo "${OPERATOR_REPO_NAME}" | tr 'A-Z' 'a-z')
+
+          # grep -c would count matching *lines*, and a PR body is frequently
+          # one line, so it would report 1 however many repos were listed.
+          listed=$(printf '%s' "${body}" \
+            | grep -oiE 'rhoai-rhtap/[A-Za-z0-9._-]+' | tr 'A-Z' 'a-z' | sort -u || true)
+          count=$(printf '%s' "${listed}" | grep -c . || true)
+
+          echo "Leader PR references ${count} rhoai-rhtap repo(s):" >&2
+          printf '%s\n' "${listed}" >&2
+          echo -n "${count}" > "$(results.component-count.path)"
+
+          if printf '%s' "${listed}" | grep -qixF "${op_repo}"; then
+            echo "✓ Operator PR included - forking from main" >&2
+            echo -n "main" > "$(results.source-branch.path)"
+            echo -n "true" > "$(results.operator-pr-included.path)"
+          else
+            echo "✓ No operator PR - forking from stable" >&2
+            echo -n "stable" > "$(results.source-branch.path)"
+            echo -n "false" > "$(results.operator-pr-included.path)"
+          fi
+        }
 
         # --- Leader PR parameters win over the PaC labels ---
         # The RHOAI early-gate pipeline is not itself PaC-triggered, so the
@@ -95,6 +174,12 @@ spec:
 
         # --- Constants ---
         EARLYGATE_SECTION_PATTERN="early.*gate"  # Matches "earlygate", "early gate", "early-gate", etc.  # Case-insensitive search in ## headings
+        # The Leader PR Manager emits "### Child PRs", not an Early Gate
+        # heading, so matching only the latter sent every real leader PR down
+        # the single-PR fallback.  Both forms list the same thing - the child
+        # PR URLs - so both are accepted as the section that holds them.
+        CHILD_PRS_SECTION_PATTERN="child.*prs"
+        SECTION_PATTERN="(${EARLYGATE_SECTION_PATTERN}|${CHILD_PRS_SECTION_PATTERN})"
         COMPONENT_MAP_URL="https://raw.githubusercontent.com/rhoai-rhtap/konflux-central/main/config/component_repo_map.json"
         ALLOWED_ORG="rhoai-rhtap"  # Only accept PRs from this GitHub org
 
@@ -184,8 +269,11 @@ spec:
           echo -n "" > "$(results.invalid-repo-warnings.path)"
           echo -n "" > "$(results.format-help-warning.path)"
           # Return components for current repo only
-          COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo]')
+          COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo] // {}')
           echo -n "${COMPONENTS}" > "$(results.group-components.path)"
+          # source-branch keeps the fallback written at the top: the body could
+          # not be read, so there is nothing to base a better decision on.
+          echo "Fork source stays at the fallback (${FALLBACK_SOURCE_BRANCH})" >&2
           exit 0
         fi
 
@@ -195,11 +283,20 @@ spec:
         # Remove Windows line endings (CR) if present
         PR_BODY=$(echo "${PR_BODY}" | tr -d '\r')
 
-        # --- Search for Early Gate section (## heading containing "earlygate") ---
-        echo "Searching for Early Gate section in PR description..." >&2
+        # --- Fork source decision ---
+        # Taken before any of the section parsing below, and from the whole
+        # body, so that it holds regardless of whether the component set can
+        # be resolved.  Orchestration must not depend on the snapshot.
+        echo "" >&2
+        echo "=== Fork Source Decision ===" >&2
+        decide_fork_source "${PR_BODY}"
+        echo "" >&2
 
-        # Check if there's a markdown heading containing "earlygate" (case-insensitive)
-        if ! echo "${PR_BODY}" | grep -qi "^#.*${EARLYGATE_SECTION_PATTERN}"; then
+        # --- Search for the child PR section (## heading) ---
+        echo "Searching for a child PR section in the PR description..." >&2
+
+        # Check if there's a markdown heading naming the section (case-insensitive)
+        if ! echo "${PR_BODY}" | grep -qiE "^#.*${SECTION_PATTERN}"; then
           echo "No Early Gate section found in PR description" >&2
           echo "Using single-PR mode (repo: ${REPO_NAME}, pr: ${PR_NUMBER})" >&2
           echo -n "false" > "$(results.has-group-config.path)"
@@ -222,25 +319,31 @@ spec:
 
           echo -n "${FORMAT_HELP}" > "$(results.format-help-warning.path)"
 
-          # Return components for current repo only
-          COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo]')
-          if [[ -z "${COMPONENTS}" || "${COMPONENTS}" == "null" ]]; then
-            echo "ERROR: No entry found for REPO_NAME=${REPO_NAME} in component_repo_map.json" >&2
-            exit 1
+          # Return components for current repo only.  A leader repo that is
+          # absent from the map is not an error: gated-artifacts-promoter
+          # publishes no images of its own, and the fork decision above has
+          # already been made and recorded.  Resolving to an empty group lets
+          # the snapshot block record "nothing to pin" and the orchestration
+          # behind it carry on, where exiting 1 here took the whole pipeline
+          # down with it.
+          COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo] // {}')
+          if [[ "${COMPONENTS}" == "{}" ]]; then
+            echo "⚠️  No entry for REPO_NAME=${REPO_NAME} in component_repo_map.json" >&2
+            echo "   Resolving to an empty component group." >&2
           fi
           echo -n "${COMPONENTS}" > "$(results.group-components.path)"
           exit 0
         fi
 
-        echo "✓ Early Gate section found" >&2
+        echo "✓ Child PR section found" >&2
         echo -n "true" > "$(results.has-group-config.path)"
         echo -n "" > "$(results.format-help-warning.path)"  # No format help needed
 
-        # --- Extract PR URLs from Early Gate section ---
+        # --- Extract PR URLs from the child PR section ---
         # Find the section and extract URLs until the next ## heading
         # Allow optional whitespace and bullets/dashes before URLs
         PR_URLS=$(echo "${PR_BODY}" | awk -v IGNORECASE=1 "
-          /^#+.*${EARLYGATE_SECTION_PATTERN}/ { found=1; next }
+          /^#+.*${SECTION_PATTERN}/ { found=1; next }
           found && /^#+/ { exit }
           found && /https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/[0-9]+/ {
             match(\$0, /https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/[0-9]+/)
@@ -255,7 +358,7 @@ spec:
           echo -n "" > "$(results.invalid-repo-warnings.path)"
           FORMAT_HELP="## ⚠️ Empty Early Gate Section"$'\n\n'"Found an Early Gate section in your PR description, but no PR URLs were listed."$'\n\n'"**Add PR URLs like this:**"$'\n'"\`\`\`markdown"$'\n'"## Early Gate Testing"$'\n'"https://github.com/rhoai-rhtap/REPO/pull/NUMBER"$'\n'"\`\`\`"$'\n\n'"See [Group Testing](https://github.com/rhoai-rhtap/konflux-central/tree/main/early-gate) for details."
           echo -n "${FORMAT_HELP}" > "$(results.format-help-warning.path)"
-          COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo]')
+          COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo] // {}')
           echo -n "${COMPONENTS}" > "$(results.group-components.path)"
           exit 0
         fi
@@ -383,7 +486,7 @@ spec:
           echo -n "false" > "$(results.has-group-config.path)"
           echo -n "" > "$(results.invalid-repo-warnings.path)"
           echo -n "" > "$(results.format-help-warning.path)"
-          COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo]')
+          COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo] // {}')
           echo -n "${COMPONENTS}" > "$(results.group-components.path)"
         else
           echo "✓ Group components resolved successfully:" >&2
