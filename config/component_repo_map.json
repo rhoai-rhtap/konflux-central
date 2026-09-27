@@ -62,6 +62,12 @@
   "fms-guardrails-orchestrator": {
     "odh-fms-guardrails-orchestrator-v3-6": "rhoai/odh-fms-guardrails-orchestrator-rhel9"
   },
+  "gated-artifacts-promoter": {
+    "odh-operator-v3-6": "rhoai/odh-rhel9-operator",
+    "odh-dashboard-v3-6": "rhoai/odh-dashboard-rhel9",
+    "odh-kserve-controller-v3-6": "rhoai/odh-kserve-controller-rhel9",
+    "odh-kf-notebook-controller-v3-6": "rhoai/odh-kf-notebook-controller-rhel9"
+  },
   "guardrails-detectors": {
     "odh-built-in-detector-v3-6": "rhoai/odh-built-in-detector-rhel9",
     "odh-guardrails-detector-huggingface-runtime-v3-6": "rhoai/odh-guardrails-detector-huggingface-runtime-rhel9"
