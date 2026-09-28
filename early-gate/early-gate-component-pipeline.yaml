@@ -349,7 +349,13 @@ spec:
           while IFS= read -r row; do
               COMPONENT_NAME=$(echo "$row" | base64 -d | jq -r '.key')
               IMAGE=$(jq -r --arg component_name "${COMPONENT_NAME}" '.[$component_name].image' <<< "${SNAPSHOT}")
-              if [[ "${COMPONENT_NAME}" == "odh-operator-v3-6" ]] && [[ "${IMAGE}" == "quay.io/rhoai/odh-rhel9-operator"* ]]; then
+              # The component name carries the release - odh-operator-v3-5 on
+              # rhoai-3.5, odh-operator-v3-6 on 3.6 - and component_repo_map.json
+              # is generated from whichever release branch is current, so a
+              # literal was wrong the moment the map was regenerated.  Matching
+              # the family keeps this correct across releases; the image check
+              # is what actually pins it to the operator.
+              if [[ "${COMPONENT_NAME}" =~ ^odh-operator-v3-[0-9]+$ ]] && [[ "${IMAGE}" == "quay.io/rhoai/odh-rhel9-operator"* ]]; then
                   SNAPSHOT_CONTAINS_ODH_OPERATOR=true
               fi
               GIT_COMMIT=$(jq -r --arg component_name "${COMPONENT_NAME}" '.[$component_name]."git.commit"' <<< "${SNAPSHOT}")
@@ -652,6 +658,27 @@ spec:
   - name: monitor-operator-build
     runAfter:
     - monitor-operator-processor
+    # Skipped when operator-processor pushed nothing.
+    #
+    # The ephemeral branch inherits build/operands-map.yaml from its source, so
+    # if that source was already current - stable is refreshed by this same
+    # processor on its own schedule - the processor recomputes identical content
+    # and its `git diff --staged --quiet || (git commit && git push)` never
+    # commits.  No push means rhods-operator-gap-eg-push.yaml never fires, and
+    # this task would then poll a check-run that cannot appear until it times
+    # out, turning a legitimate no-op into a 90-minute failure.
+    #
+    # processor-commit is the branch HEAD read after the processor ran and
+    # branch-sha is the commit the branch was forked at, so they are equal
+    # exactly when nothing was pushed.  Skipping here also skips nothing
+    # downstream - this is the last task in the chain - and the pipeline
+    # succeeds, which is the correct verdict: there was no operator change to
+    # gate.
+    when:
+    - input: $(tasks.monitor-operator-processor.results.processor-commit)
+      operator: notin
+      values:
+      - $(tasks.fork-operator-branch.results.branch-sha)
     params:
     - name: repo
       value: $(params.operator-repo)
