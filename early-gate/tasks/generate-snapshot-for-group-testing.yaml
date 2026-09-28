@@ -7,10 +7,20 @@ spec:
     RHOAI adaptation of opendatahub-io/odh-konflux-central's
     early-gate/tasks/generate-snapshot-for-group-testing.yaml.
 
-    The digest-resolution logic is unchanged.  What differs is the component
-    map it falls back to (rhoai-rhtap/konflux-central), the per-PR tag it
-    looks for (rhoai-pr-<N> rather than odh-pr-<N>) and the tag it falls back
-    to when that PR image has not been published yet.
+    What differs from upstream is the component map it falls back to
+    (rhoai-rhtap/konflux-central), the per-PR tag it looks for (rhoai-pr-<N>
+    rather than odh-pr-<N>), the tag it falls back to when that PR image has
+    not been published yet, and one extra probe between the two.
+
+    That extra probe is the substantive change.  Upstream assumes a component
+    PR build lands in the component's own repository under a tag naming the
+    PR, which is true of ODH and false of RHOAI: every RHOAI component PR
+    pipeline publishes to the one shared repository
+    quay.io/rhoai/pull-request-pipelines, tagged <component>-<commit>.  Without
+    a probe for that layout the PR tag never resolved and every component in
+    every group silently used its released image instead of the proposed one,
+    which is most of the value of group testing.  early-gate/PR-DIGESTS.md has
+    the measurements and the alternatives that were rejected.
 
     That fallback is rhoai-3.5, not rhoai-3.6, because rhoai-3.5 is what
     operator-processor resolves against.  For an eg-* branch the processor
@@ -41,6 +51,14 @@ spec:
       type: string
       default: rhoai-3.5
       description: Quay tag when PR image is missing
+    - name: pr-pipelines-repo
+      type: string
+      default: rhoai/pull-request-pipelines
+      description: |
+        Shared Quay repository that RHOAI component PR pipelines publish to,
+        without the quay.io/ prefix.  Probed as <repo>:<component>-<commit>
+        when the component carries a head SHA.  Set empty to disable that
+        probe and keep only the own-repository one.
     - name: leader-pr-repo
       type: string
       default: ""
@@ -85,6 +103,8 @@ spec:
           value: $(params.COMPONENTS)
         - name: FALLBACK_TAG
           value: $(params.fallback-tag)
+        - name: PR_PIPELINES_REPO
+          value: $(params.pr-pipelines-repo)
         - name: WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND
           value: $(workspaces.basic-auth.bound)
         - name: WORKSPACE_BASIC_AUTH_DIRECTORY_PATH
@@ -184,10 +204,14 @@ spec:
             # Check if value is a string (old format) or object (new format with PR metadata)
             value_type=$(echo "$value_raw" | jq -r 'type')
 
+            component_sha=""
             if [[ "$value_type" == "object" ]]; then
-              # New format: {"quay_path": "...", "pr": "123"}
+              # New format: {"quay_path": "...", "pr": "123", "sha": "abc..."}
+              # sha is optional - the leader repo's own components never carry
+              # one, and a child PR whose head could not be read has it empty.
               repo_path=$(echo "$value_raw" | jq -r '.quay_path')
               component_pr=$(echo "$value_raw" | jq -r '.pr')
+              component_sha=$(echo "$value_raw" | jq -r '.sha // ""')
               TAG="rhoai-pr-${component_pr}"
               echo "component=${component} (from PR #${component_pr})"
             else
@@ -199,30 +223,75 @@ spec:
 
             echo "repo_path=${repo_path}"
 
-            # Check if PR-specific image exists
+            # Where this component's image will be read from.  Both are
+            # rewritten by whichever probe below hits.
+            full_repo="quay.io/${repo_path}"
             IMAGE_STATUS=""
-            if skopeo inspect ${SKOPEO_AUTH} "docker://quay.io/${repo_path}:${TAG}" &>/dev/null; then
+
+            # --- Probe 1: the component's own repository, tagged by PR number
+            # The ODH convention this task was written against.  One HEAD
+            # request, and it is the unambiguous form because the repository
+            # itself names the component.  RHOAI does not currently publish
+            # this way, but it costs little to keep looking.
+            if skopeo inspect ${SKOPEO_AUTH} "docker://${full_repo}:${TAG}" &>/dev/null; then
               echo "✓ Found image with tag ${TAG}"
               IMAGE_STATUS="ready"
-            else
-              echo "⚠️  WARNING: Component '${component}' does not have PR image for tag ${TAG}" >&2
-              echo "   Quay query returned: 404 Not Found" >&2
-              echo "   Reason: PR build may still be in progress" >&2
+            fi
+
+            # --- Probe 2: the shared PR-pipelines repository, tagged by commit
+            # What RHOAI actually does.  Every component PR pipeline in
+            # red-hat-data-services/konflux-central publishes to the single
+            # repository quay.io/rhoai/pull-request-pipelines under the tag
+            # <component>-<commit>, so probe 1 never hits and, before this,
+            # every component in every group fell straight through to the
+            # release tag - meaning the gate tested released images rather
+            # than the proposed ones.  See early-gate/PR-DIGESTS.md.
+            #
+            # By commit rather than by PR number deliberately.  The secondary
+            # tag those pipelines emit, pr-<N>-into-<branch>, carries no
+            # component name: PR #42 in kserve and PR #42 in odh-dashboard
+            # write the same tag into the same repository and the second one
+            # wins.  The commit-qualified tag is unique, and every PR pipeline
+            # emits it.
+            if [[ -z "${IMAGE_STATUS}" && -n "${PR_PIPELINES_REPO}" && -n "${component_sha}" ]]; then
+              # Map keys carry the release - odh-kserve-controller-v3-5 - but
+              # the shared repository's tags do not, because one PR pipeline
+              # serves every release branch.
+              pr_prefix=$(printf '%s' "${component}" | sed -E 's/-v[0-9]+-[0-9]+$//')
+              pr_tag="${pr_prefix}-${component_sha}"
+              pr_repo="quay.io/${PR_PIPELINES_REPO}"
+              echo "Probing PR build: ${pr_repo}:${pr_tag}" >&2
+              if skopeo inspect ${SKOPEO_AUTH} "docker://${pr_repo}:${pr_tag}" &>/dev/null; then
+                echo "✓ Found PR build in the shared repository" >&2
+                full_repo="${pr_repo}"
+                TAG="${pr_tag}"
+                IMAGE_STATUS="ready"
+              fi
+            fi
+
+            # --- Neither probe hit: use the release tag
+            if [[ -z "${IMAGE_STATUS}" ]]; then
+              echo "⚠️  WARNING: Component '${component}' has no PR image" >&2
+              echo "   Looked for: quay.io/${repo_path}:${TAG}" >&2
+              if [[ -n "${PR_PIPELINES_REPO}" && -n "${component_sha}" ]]; then
+                echo "               quay.io/${PR_PIPELINES_REPO}:${pr_tag}" >&2
+              elif [[ -n "${PR_PIPELINES_REPO}" ]]; then
+                echo "   Skipped the shared-repository probe: no head SHA for this component" >&2
+              fi
+              echo "   Reason: the PR build may still be running, or the PR" >&2
+              echo "           pipeline for this component was never triggered" >&2
               echo "   Action: Falling back to ${FALLBACK_TAG} tag" >&2
-              echo "   Impact: Group test will use stable image instead of PR code" >&2
+              echo "   Impact: Group test will use the released image, not PR code" >&2
 
               # Track this fallback for PR comment
               if [[ "$value_type" == "object" ]]; then
                 echo "- Component \`${component}\` from PR #${component_pr}: using \`${FALLBACK_TAG}\` (PR build not ready)" >> "$FALLBACK_WARNINGS_FILE"
               fi
 
+              full_repo="quay.io/${repo_path}"
               TAG=${FALLBACK_TAG}
               IMAGE_STATUS="fallback"
             fi
-
-
-            # Construct full quay URL
-            full_repo="quay.io/${repo_path}"
 
             echo "Processing component: $component" >&2
             echo "Repository: $full_repo" >&2

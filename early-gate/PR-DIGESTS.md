@@ -1,10 +1,22 @@
 # PR-specific digests in the early gate
 
-`generate-snapshot-for-group-testing` probes `quay.io/<quay_path>:rhoai-pr-<N>`
-for each component in the group and falls back to `rhoai-3.5` when that tag is
-absent. The fallback is correct and tested. The probe, today, never hits.
+**Status: option A (by commit) is implemented.** `generate-snapshot-for-group-testing`
+now probes, in order:
 
-This note records why, and what would have to change.
+1. `quay.io/<quay_path>:rhoai-pr-<N>` — the component's own repository, ODH-style
+2. `quay.io/rhoai/pull-request-pipelines:<component>-<commit>` — what RHOAI actually publishes
+3. `quay.io/<quay_path>:rhoai-3.5` — the release fallback
+
+Probe 2 is the one that hits on RHOAI. It needs the head SHA of each child PR,
+which `resolve-group-configuration` reads from the GitHub API while it is
+already walking the child PR list and carries in each component's `sha` field.
+
+The rest of this note is the measurement that led there, kept because it also
+explains why the other options were rejected.
+
+Before probe 2 existed, the gate had only probes 1 and 3, so every component in
+every group fell through to the release tag — meaning the gate validated the
+operator against *released* component images rather than the proposed ones.
 
 ## What the gate looks for
 
@@ -114,12 +126,47 @@ meant to give — a component PR that would break the operator is not caught,
 because its image is never the one tested — but it is honest, and it is what is
 currently verified end to end.
 
-## Recommendation
+## What was done
 
-Keep C for the POC; it is tested and it does not depend on anything outside
-this repository. Pursue **A, in the by-commit form**, when PR-specific digests
-are actually needed: it is contained to `generate-snapshot` and
-`resolve-group-configuration`, it is unambiguous, and it works for every
-component that has a PR pipeline. B is the right long-term shape but is a
-konflux-central-wide change with release-registry and retention implications
-that need an owner outside this POC.
+**A, in the by-commit form.** Contained to `generate-snapshot` and
+`resolve-group-configuration`, unambiguous, and it works for every component
+that has a PR pipeline. C remains the behaviour whenever probe 2 misses, which
+is still the common case — most component PRs never trigger a build, because
+the PR pipelines are gated behind `on-label` / `on-comment`.
+
+B is the right long-term shape but is a konflux-central-wide change with
+release-registry and retention implications that need an owner outside this
+POC. It is not proposed here.
+
+### Evidence for the tag shape
+
+Read live from `quay.io/rhoai/pull-request-pipelines` (anonymously readable):
+
+| | count |
+|---|---|
+| tags sampled | 3000 |
+| matching `<name>-<40-hex>` | 474 |
+| distinct `<name>` prefixes among those | 36 |
+| prefixes declared by a `*-pull-request.yaml` in `konflux-central@main` | 32 |
+| not declared | 4 (`main`, `main-rocm`, `odh-mod-arch-data-registry`, `odh-operator-pr-51`) |
+
+And the derivation the probe relies on — component name in
+`component_repo_map.json` minus its `-vX-Y` suffix equals the PR-pipeline tag
+prefix — holds for 93 of the 110 PR pipelines against `rhoai-3.6` and 74 of 110
+against `rhoai-3.5`. The shortfall is components that have a PR pipeline but no
+push pipeline on that release branch, not a break in the rule.
+
+### What still gates it in practice
+
+A component PR only produces an image if its PR pipeline actually runs, and
+most are behind `on-label` (`kfbuild-all`, `kfbuild-<component>`) or
+`on-comment` (`/build-konflux <component>`). A gated group whose child PRs were
+never labelled still resolves entirely by fallback. That is a property of how
+RHOAI triggers PR builds, not of the gate.
+
+One further trap, found on `red-hat-data-services/kserve@test-gap`: PR
+pipelines resolve their definition from `konflux-central` at
+`{{ target_branch }}`, which only exists for `rhoai-X.Y`. On any other base
+branch the resolver 404s and no PipelineRun is created at all — no build and no
+check-run, which reads exactly like "the pipeline never triggered".
+`red-hat-data-services/kserve#4636` pins it for that branch.

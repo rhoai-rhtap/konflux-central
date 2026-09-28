@@ -77,6 +77,18 @@ spec:
     type: string
     default: "stable"
     description: Branch to fork from when the leader PR cannot be read
+  - name: allowed-child-orgs
+    type: string
+    default: "rhoai-rhtap red-hat-data-services"
+    description: |
+      GitHub orgs a child PR listed in the leader PR may come from.  Anything
+      else is skipped and reported.
+
+      Both orgs are allowed because both are real sources.  rhoai-rhtap holds
+      the POC forks; red-hat-data-services holds the actual component repos,
+      and a component PR worth gating is normally opened there - it is the
+      same org that owns konflux-central and publishes every image the
+      snapshot resolves, so trusting it is not a widening of trust.
   - name: image-expires-after
     type: string
     default: "7d"
@@ -220,6 +232,8 @@ spec:
       value: $(params.operator-repo)
     - name: fallback-source-branch
       value: $(params.fallback-source-branch)
+    - name: allowed-orgs
+      value: $(params.allowed-child-orgs)
     workspaces:
     # basic-auth here is a GitHub token, not a registry credential: this
     # task reads token/.git-credentials/.github-token out of it to call the
@@ -237,10 +251,12 @@ spec:
       - name: pathInRepo
         value: early-gate/tasks/resolve-group-configuration.yaml
 
-  # Resolves each of those components to a concrete quay digest - the
-  # rhoai-pr-<N> image when the component's own PR build has published one,
-  # otherwise the rhoai-3.6 fallback - and stores the result as a trusted
-  # artifact.
+  # Resolves each of those components to a concrete quay digest and stores the
+  # result as a trusted artifact.  Three probes, in order: the component's own
+  # repository tagged rhoai-pr-<N>, then the shared
+  # quay.io/rhoai/pull-request-pipelines repository tagged
+  # <component>-<commit>, then the release tag.  The middle one is what RHOAI
+  # PR pipelines actually publish; see early-gate/PR-DIGESTS.md.
   - name: generate-snapshot
     runAfter:
     - resolve-group-configuration
@@ -658,27 +674,18 @@ spec:
   - name: monitor-operator-build
     runAfter:
     - monitor-operator-processor
-    # Skipped when operator-processor pushed nothing.
+    # This task used to be guarded by a `when:` comparing processor-commit
+    # against branch-sha, to skip the build when the processor had pushed
+    # nothing.  That guard is gone, and the no-op is fixed at its source
+    # instead: operator-processor now commits with --allow-empty on an eg-*
+    # branch, so the push - and therefore the PaC build - always happens.
     #
-    # The ephemeral branch inherits build/operands-map.yaml from its source, so
-    # if that source was already current - stable is refreshed by this same
-    # processor on its own schedule - the processor recomputes identical content
-    # and its `git diff --staged --quiet || (git commit && git push)` never
-    # commits.  No push means rhods-operator-gap-eg-push.yaml never fires, and
-    # this task would then poll a check-run that cannot appear until it times
-    # out, turning a legitimate no-op into a 90-minute failure.
-    #
-    # processor-commit is the branch HEAD read after the processor ran and
-    # branch-sha is the commit the branch was forked at, so they are equal
-    # exactly when nothing was pushed.  Skipping here also skips nothing
-    # downstream - this is the last task in the chain - and the pipeline
-    # succeeds, which is the correct verdict: there was no operator change to
-    # gate.
-    when:
-    - input: $(tasks.monitor-operator-processor.results.processor-commit)
-      operator: notin
-      values:
-      - $(tasks.fork-operator-branch.results.branch-sha)
+    # Fixing it there is the better trade.  The guard turned a no-op into a
+    # green run with BUILD_STATUS, OPERATOR_IMAGE_URL and OPERATOR_IMAGE_DIGEST
+    # silently absent, which is indistinguishable from a run that genuinely
+    # built nothing wrong.  Always building keeps every run producing the same
+    # results, and the cost is one redundant build of a throwaway branch that
+    # the finally task deletes anyway.
     params:
     - name: repo
       value: $(params.operator-repo)
