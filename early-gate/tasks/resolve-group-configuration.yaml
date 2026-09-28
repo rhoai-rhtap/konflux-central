@@ -29,6 +29,16 @@ spec:
     longer be allowed to fail on a leader PR the snapshot block cannot use.
     Every exit path writes every result, and a leader repo that owns no
     components resolves to an empty group rather than exiting 1.
+
+    A third addition: each child component carries the head SHA of the PR it
+    came from, alongside the PR number.  RHOAI PR pipelines publish to a
+    shared repository keyed by commit rather than to the component's own
+    repository keyed by PR number, so the number alone cannot find the image.
+    generate-snapshot uses the SHA; see early-gate/PR-DIGESTS.md.
+
+    The org allowlist is a parameter rather than a constant for the same
+    reason: real component PRs live in red-hat-data-services, not in the
+    rhoai-rhtap forks, so gating them means naming that org explicitly.
   workspaces:
     - name: basic-auth
       optional: true
@@ -53,6 +63,18 @@ spec:
       type: string
       default: "stable"
       description: Branch to fork from when the leader PR cannot be read
+    - name: allowed-orgs
+      type: string
+      default: "rhoai-rhtap"
+      description: |
+        Space- or comma-separated GitHub orgs a child PR may come from.  A
+        child PR outside this list is skipped and reported, which is what
+        stops a leader PR from pulling an arbitrary third party's code into
+        the group.
+
+        The default is the fork org alone, matching the original behaviour.
+        A caller that also gates real component PRs - which live in
+        red-hat-data-services, not in the forks - has to say so explicitly.
   results:
     - name: group-components
       description: Resolved components JSON with PR metadata for group testing
@@ -98,6 +120,8 @@ spec:
           value: $(params.operator-repo-name)
         - name: FALLBACK_SOURCE_BRANCH
           value: $(params.fallback-source-branch)
+        - name: ALLOWED_ORGS
+          value: $(params.allowed-orgs)
         - name: WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND
           value: $(workspaces.basic-auth.bound)
         - name: WORKSPACE_BASIC_AUTH_DIRECTORY_PATH
@@ -181,7 +205,11 @@ spec:
         CHILD_PRS_SECTION_PATTERN="child.*prs"
         SECTION_PATTERN="(${EARLYGATE_SECTION_PATTERN}|${CHILD_PRS_SECTION_PATTERN})"
         COMPONENT_MAP_URL="https://raw.githubusercontent.com/rhoai-rhtap/konflux-central/main/config/component_repo_map.json"
-        ALLOWED_ORG="rhoai-rhtap"  # Only accept PRs from this GitHub org
+        # Normalised to one org per line so the membership test below is an
+        # exact whole-string match.  A substring test would let
+        # "rhoai-rhtap-evil" through on a list containing "rhoai-rhtap".
+        ALLOWED_ORG_LIST=$(printf '%s' "${ALLOWED_ORGS}" | tr ',' ' ' | tr -s ' ' '\n' | grep -v '^$' || true)
+        echo "Child PRs accepted from: $(printf '%s' "${ALLOWED_ORG_LIST}" | tr '\n' ' ')" >&2
 
         # --- Fetch component_repo_map.json (critical dependency) ---
         echo "Fetching component_repo_map.json..." >&2
@@ -239,14 +267,21 @@ spec:
           fi
         fi
 
+        # Which Authorization scheme the token turned out to want, so that the
+        # second API call this task makes - the per-child-PR head SHA lookup
+        # below - does not have to rediscover it.  Empty means unauthenticated.
+        AUTH_SCHEME=""
+
         if [[ -n "${GITHUB_TOKEN}" ]]; then
           echo "Using authenticated GitHub API (token length: ${#GITHUB_TOKEN} chars)" >&2
           # Try with 'token' prefix first (classic format)
+          AUTH_SCHEME="token"
           PR_DATA=$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "${GITHUB_API_URL}" 2>&1)
 
           # If that fails with 401, try with 'Bearer' prefix
           if echo "${PR_DATA}" | grep -q "Bad credentials\|Requires authentication"; then
             echo "Classic token auth failed, trying Bearer format..." >&2
+            AUTH_SCHEME="Bearer"
             PR_DATA=$(curl -sS -H "Authorization: Bearer ${GITHUB_TOKEN}" "${GITHUB_API_URL}" 2>&1)
           fi
 
@@ -255,12 +290,24 @@ spec:
             echo "ERROR: GitHub authentication failed with provided token" >&2
             echo "Response: ${PR_DATA:0:200}" >&2
             echo "Falling back to unauthenticated API..." >&2
+            AUTH_SCHEME=""
             PR_DATA=$(curl -sSf "${GITHUB_API_URL}" 2>&1)
           fi
         else
           echo "⚠️  WARNING: No GitHub authentication found, using unauthenticated API (rate limited)" >&2
           PR_DATA=$(curl -sSf "${GITHUB_API_URL}" 2>&1)
         fi
+
+        # Reuses whatever the ladder above settled on.  Never -f: a child PR
+        # that cannot be read is a degraded result, not a failed pipeline, and
+        # the caller checks the parsed value rather than the exit status.
+        gh_get() {
+          if [[ -n "${AUTH_SCHEME}" ]]; then
+            curl -sS -H "Authorization: ${AUTH_SCHEME} ${GITHUB_TOKEN}" "$1" || true
+          else
+            curl -sS "$1" || true
+          fi
+        }
 
         if [[ -z "${PR_DATA}" ]]; then
           echo "⚠️  WARNING: Failed to fetch PR description from GitHub API" >&2
@@ -420,13 +467,13 @@ spec:
           echo "  Repo: ${REPO}" >&2
           echo "  PR: ${PR}" >&2
 
-          # Security check: Only allow PRs from rhoai-rhtap organization
-          if [[ "${ORG}" != "${ALLOWED_ORG}" ]]; then
+          # Security check: only allow PRs from an org the caller named
+          if ! printf '%s\n' "${ALLOWED_ORG_LIST}" | grep -qixF "${ORG}"; then
             echo "⚠️  WARNING: PR from unauthorized organization: ${ORG}" >&2
-            echo "   Only PRs from ${ALLOWED_ORG} are allowed" >&2
+            echo "   Allowed: $(printf '%s' "${ALLOWED_ORG_LIST}" | tr '\n' ' ')" >&2
             echo "   Skipping this entry" >&2
             # Track warning for PR comment
-            WARNING_MSG="⚠️ PR from \`${ORG}/${REPO}\` (#${PR}) was skipped - only PRs from \`${ALLOWED_ORG}\` organization are allowed."
+            WARNING_MSG="⚠️ PR from \`${ORG}/${REPO}\` (#${PR}) was skipped - only PRs from \`$(printf '%s' "${ALLOWED_ORG_LIST}" | tr '\n' ' ')\` are allowed."
             if [[ -z "${WARNINGS}" ]]; then
               WARNINGS="${WARNING_MSG}"
             else
@@ -453,16 +500,39 @@ spec:
 
           echo "  Found components for ${REPO}" >&2
 
+          # Head SHA of the child PR.
+          #
+          # generate-snapshot needs it to find the image this PR actually
+          # built.  RHOAI component PR pipelines do not follow the ODH
+          # convention the upstream task assumes: instead of tagging their own
+          # repository with the PR number, all of them publish to the single
+          # shared repository quay.io/rhoai/pull-request-pipelines under the
+          # tag <component>-<commit>.  The PR number alone cannot locate that
+          # image; the commit can.  See early-gate/PR-DIGESTS.md.
+          #
+          # Empty is a supported answer.  A PR that cannot be read just means
+          # generate-snapshot skips that probe and falls back to the release
+          # tag, which is what it did for every component before this existed.
+          PR_SHA=$(gh_get "https://api.github.com/repos/${ORG}/${REPO}/pulls/${PR}" \
+                     | jq -r '.head.sha // ""' 2>/dev/null || true)
+          if [[ -n "${PR_SHA}" ]]; then
+            echo "  Head SHA: ${PR_SHA}" >&2
+          else
+            echo "  ⚠️  Could not read head SHA for ${ORG}/${REPO}#${PR} - the" >&2
+            echo "      snapshot will fall back to the release tag for it." >&2
+          fi
+
           # Add PR metadata to each component
           # Transform: {"comp1": "path1", "comp2": "path2"}
-          # To: {"comp1": {"quay_path": "path1", "pr": "123"}, "comp2": {...}}
-          REPO_COMPONENTS_WITH_PR=$(echo "${REPO_COMPONENTS}" | jq -c --arg pr "${PR}" '
+          # To: {"comp1": {"quay_path": "path1", "pr": "123", "sha": "abc..."}, ...}
+          REPO_COMPONENTS_WITH_PR=$(echo "${REPO_COMPONENTS}" | jq -c --arg pr "${PR}" --arg sha "${PR_SHA}" '
             to_entries |
             map({
               key: .key,
               value: {
                 quay_path: .value,
-                pr: $pr
+                pr: $pr,
+                sha: $sha
               }
             }) |
             from_entries
