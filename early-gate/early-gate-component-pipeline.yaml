@@ -160,23 +160,33 @@ spec:
       earlier run, or to gate against a branch that is not yet the newest.
   - name: bundle-output-image
     type: string
-    # rhoda-, not odh-: this is the Konflux Component name, typo and all.
-    # Component names are immutable, so the ImageRepository, the service
-    # account and the component label all carry it.
-    default: "quay.io/redhat-user-workloads/rhoai-tenant/rhoda-operator-bundle-gap"
+    # rhod-, not rhoda- and not odh-.  Two Components are bound to the
+    # build-config repository; the one that works here is the public one.
+    # monitor-bundle-build resolves its digest through quay.io's anonymous
+    # registry v2 token - the one lookup in the chain that takes no
+    # credential - and rhoda-'s repository is private:
+    #
+    #     rhoda-operator-bundle-gap   manifests/<tag> -> 401
+    #     rhod-operator-bundle-gap    manifests/<tag> -> 404 (public)
+    #
+    # The failure would be quiet: the build succeeds, the monitor warns
+    # rather than fails, and BUNDLE_IMAGE_DIGEST and
+    # BUNDLE_IMAGE_REF_BY_DIGEST come back empty - which is the whole of
+    # DR-7, the handoff Block 3 consumes.
+    default: "quay.io/redhat-user-workloads/rhoai-tenant/rhod-operator-bundle-gap"
     description: |
       Image repository, without a tag.  Deliberately not
       quay.io/rhoai/odh-operator-bundle: that is the release repository, and a
       bundle assembled from unmerged PRs must not land in it under any tag.
       Must match output-image in the build-config repo's
-      .tekton/rhoda-operator-bundle-gap-push.yaml.
+      .tekton/rhod-operator-bundle-gap-push.yaml.
   - name: bundle-build-check-name
     type: string
-    default: "rhoda-operator-bundle-gap-on-push"
+    default: "rhod-operator-bundle-gap-on-push"
     description: |
       Name of the PaC check-run to watch for the bundle.  Must match the
       PipelineRun name in the build-config repo's
-      .tekton/rhoda-operator-bundle-gap-push.yaml, since that is what PaC
+      .tekton/rhod-operator-bundle-gap-push.yaml, since that is what PaC
       reports as.
   - name: bundle-verify-strict
     type: string
@@ -1080,9 +1090,11 @@ spec:
     # This whole PipelineRun runs as build-pipeline-rhods-operator-gap, the
     # service account Konflux created for the rhods-operator-gap Component.
     # Its registry push credential covers that Component's repository and no
-    # other.  rhoda-operator-bundle-gap belongs to a different Component with
-    # its own build-pipeline-rhoda-operator-bundle-gap, so writing a trusted
-    # artifact there fails at the upload:
+    # other.  Whichever bundle repository bundle-output-image names belongs to
+    # a different Component with its own build-pipeline-<component> service
+    # account - that was rhoda-operator-bundle-gap when this failed and is
+    # rhod-operator-bundle-gap now, and the outcome is the same either way -
+    # so writing a trusted artifact there fails at the upload:
     #
     #     Using token for quay.io/redhat-user-workloads/rhoai-tenant
     #     Uploading b7aede9f2f1e SOURCE_ARTIFACT
