@@ -4,17 +4,20 @@ metadata:
   name: early-gate-component-pipeline
 spec:
   description: |
-    Early-gate orchestration pipeline for the RHOAI operator.
+    Early-gate orchestration pipeline for the RHOAI operator and its bundle.
 
     Structured after opendatahub-io/odh-konflux-central's early-gate-component-pipeline,
-    but with Block 1 inverted.  Upstream builds the operator inline - clone,
-    prefetch, buildah, apply-tags - inside this pipeline.  Here the container
-    build lives in its own PaC-triggered PipelineRun
-    (early-gate/rhods-operator-gap-eg-push.yaml, which is deployed to the
-    operator repo's .tekton/ directory), and this pipeline's job is to
-    construct the branch that build runs against and then watch it.
+    but with both blocks inverted.  Upstream builds inline - clone, prefetch,
+    buildah, apply-tags - inside this pipeline.  Here each container build lives
+    in its own PaC-triggered PipelineRun, and this pipeline's job is to
+    construct the branch that build runs against and then watch it:
 
-    The sequence is:
+      Block 1  operator  -> rhods-operator-gap-eg-push.yaml, in the operator
+                            repo's .tekton/
+      Block 2  bundle    -> odh-operator-bundle-v3-6-eg-push.yaml, in
+                            RHOAI-Build-Config's .tekton/
+
+    Block 1's sequence is:
 
       resolve-group-...      read the leader PR once: expand it into a
                              component set AND decide main vs stable
@@ -38,13 +41,32 @@ spec:
     A single entry point is only an improvement if it cannot become a single
     point of failure.
 
-    Nothing is ever pushed to main or stable.  Every write goes to the
-    ephemeral branch, which the finally task deletes once the image carries a
-    durable tag.
+    Block 2 then takes the operator digest Block 1 produced and turns it into a
+    bundle:
 
-    Block 2 (bundle) and Block 3 (FBC) are intentionally out of scope, but
-    OPERATOR_IMAGE_URL/OPERATOR_IMAGE_DIGEST are published as pipeline results
-    so they have something to consume when they arrive.
+      clone-build-config     resolve the latest rhoai-X.Y and clone it
+      fork-bundle-branch     fork eg-bundle-<run-uid> from that exact commit
+      update-group-snapshot  inject the Block 1 operator digest into the
+                             bundle inputs, before any processing
+      bundle-processor       run RHOAI's bundle-processor.py over the tree
+      verify-bundle-images   fail if anything in the bundle is release-tagged
+      push-bundle-to-...     commit to the ephemeral branch, triggering PaC
+      monitor-bundle-build   wait for that build, resolve the bundle digest
+
+    Nothing is ever pushed to main, to stable, or to a rhoai-X.Y release
+    branch.  Every write in both blocks goes to an ephemeral eg-* branch, which
+    a finally task deletes once the image carries a durable tag.  This is the
+    single most important property of the design: the release branches are read
+    from and never written to, which is precisely what the existing
+    process-operator-bundle.yaml GitHub workflow does not do.
+
+    Block 3 (FBC) is out of scope, but BUNDLE_IMAGE_DIGEST and
+    BUNDLE_IMAGE_REF_BY_DIGEST are published as pipeline results so it has
+    something to consume when it arrives, and cleanup of Block 2's branch can be
+    deferred for it if it turns out to need the branch as well.
+
+    See early-gate/docs/block2-bundle-design.md for the design-review
+    traceability and the deployment prerequisites.
 
   params:
   # expected-cluster and pipeline-type used to live here.  They only ever fed
@@ -109,6 +131,75 @@ spec:
       Name of the PaC check-run to watch.  Must match the PipelineRun name in
       rhods-operator-gap-eg-push.yaml, since that is what PaC reports as.
 
+  # --- Bundle build (Block 2) ---
+  - name: build-config-repo
+    type: string
+    # The POC fork, matching RBC_REPO_NAME in the operator repo's
+    # .github/workflows/operator-processor.yaml.  Block 2 pushes an ephemeral
+    # branch to this repo, so it has to be one the gate may write to;
+    # red-hat-data-services/RHOAI-Build-Config is not.
+    default: "rhoai-rhtap/RHOAI-Build-Config-gap"
+    description: org/repo holding the bundle sources
+  - name: build-config-repo-url
+    type: string
+    default: "https://github.com/rhoai-rhtap/RHOAI-Build-Config-gap.git"
+    description: |
+      Clone URL for the above.  Separate from build-config-repo because the
+      clone is anonymous over https while the API calls address org/repo.
+  - name: build-config-branch-override
+    type: string
+    # Required against the POC fork, not merely convenient.  clone-build-config
+    # discovers the release branch with `git ls-remote --heads refs/heads/rhoai-*`
+    # filtered to ^[23]\.[0-9]+$, and RHOAI-Build-Config-gap carries no rhoai-X.Y
+    # branch at all - only main and gap-poc - so discovery would exit 1 with
+    # "No rhoai-X.Y branches found".  Clear this when pointing at the real RBC.
+    default: "gap-poc"
+    description: |
+      Pin the release branch Block 2 forks from instead of discovering the
+      latest rhoai-X.Y.  Empty is the normal path.  Set it to reproduce an
+      earlier run, or to gate against a branch that is not yet the newest.
+  - name: bundle-output-image
+    type: string
+    # rhoda-, not odh-: this is the Konflux Component name, typo and all.
+    # Component names are immutable, so the ImageRepository, the service
+    # account and the component label all carry it.
+    default: "quay.io/redhat-user-workloads/rhoai-tenant/rhoda-operator-bundle-gap"
+    description: |
+      Image repository, without a tag.  Deliberately not
+      quay.io/rhoai/odh-operator-bundle: that is the release repository, and a
+      bundle assembled from unmerged PRs must not land in it under any tag.
+      Must match output-image in the build-config repo's
+      .tekton/rhoda-operator-bundle-gap-push.yaml.
+  - name: bundle-build-check-name
+    type: string
+    default: "rhoda-operator-bundle-gap-on-push"
+    description: |
+      Name of the PaC check-run to watch for the bundle.  Must match the
+      PipelineRun name in the build-config repo's
+      .tekton/rhoda-operator-bundle-gap-push.yaml, since that is what PaC
+      reports as.
+  - name: bundle-verify-strict
+    type: string
+    default: "false"
+    description: |
+      Passed to verify-bundle-images.  "true" additionally fails the gate when a
+      gated component is pinned in the snapshot but absent from the bundle.
+      Off by default because not every gated component appears in the operator
+      bundle; on for a smoke test against a group that is known to be
+      bundle-visible.
+  - name: defer-bundle-branch-cleanup
+    type: string
+    default: "false"
+    description: |
+      Leave the bundle's ephemeral branch in place instead of deleting it.  For
+      the case where Block 3 forks from it rather than from the release branch;
+      see the note in early-gate/tasks/cleanup-ephemeral-branch.yaml.  Whoever
+      sets this owns deleting the branch.
+  - name: snapshot-operator-key
+    type: string
+    default: "odh-operator-ci"
+    description: Key under which the operator is recorded in config/snapshot.json
+
   # --- Self-reference ---
   - name: konflux-central-revision
     type: string
@@ -128,6 +219,13 @@ spec:
   - name: build-timeout-minutes
     type: string
     default: "90"
+  - name: bundle-build-timeout-minutes
+    type: string
+    default: "60"
+    description: |
+      Shorter than the operator's.  The bundle is FROM scratch with no compile
+      step and no multi-arch fan-out, so an hour is generous; a bundle build
+      still running after that is stuck, not slow.
 
   results:
   - name: EG_BRANCH
@@ -151,6 +249,32 @@ spec:
     value: $(tasks.generate-snapshot.results.SNAPSHOT_ARTIFACT)
   - name: BUILD_STATUS
     value: $(tasks.monitor-operator-build.results.build-status)
+
+  # --- Block 2 outputs, for Block 3 (DR-7e) ---
+  # Explicit pipeline results, not internal state.  Block 3 is a separate
+  # pipeline; anything it needs has to cross the pipeline boundary here or it
+  # does not exist as far as Block 3 is concerned.
+  - name: EG_BUNDLE_BRANCH
+    value: $(tasks.fork-bundle-branch.results.branch-name)
+  - name: BUNDLE_RELEASE_BRANCH
+    description: The rhoai-X.Y branch Block 2 resolved and forked from
+    value: $(tasks.clone-build-config.results.release-branch)
+  - name: BUNDLE_COMMIT
+    value: $(tasks.push-bundle-to-ephemeral-branch.results.commit-sha)
+  - name: BUNDLE_IMAGE_URL
+    value: $(tasks.monitor-bundle-build.results.image-ref)
+  # The digest is the one that matters.  An FBC fragment references the bundle
+  # by digest, and eg-<sha> is mutable in principle - it is re-pushed if the
+  # same commit is rebuilt - so the tag alone is not a durable handle.
+  - name: BUNDLE_IMAGE_DIGEST
+    value: $(tasks.monitor-bundle-build.results.image-digest)
+  - name: BUNDLE_IMAGE_REF_BY_DIGEST
+    value: $(tasks.monitor-bundle-build.results.image-ref-by-digest)
+  - name: BUNDLE_BUILD_STATUS
+    value: $(tasks.monitor-bundle-build.results.build-status)
+  - name: BUNDLE_VERIFIED
+    description: '"true" when every image in the bundle passed the DR-6 checks'
+    value: $(tasks.verify-bundle-images.results.verified)
 
   workspaces:
   - name: github-credentials
@@ -857,6 +981,235 @@ spec:
           echo -n "timeout" > $(results.build-status.path)
           exit 1
 
+  # --------------------------------------------------------------------------
+  # Block 2 - bundle
+  # --------------------------------------------------------------------------
+  #
+  # Same inverted shape as Block 1: this pipeline prepares a branch and watches
+  # the PaC build that the push triggers.  Upstream ODH does Block 2 entirely
+  # in-pipeline - clone, process, prefetch, buildah, apply-tags, chained through
+  # trusted artifacts, with no git push anywhere - which works for ODH because
+  # its bundle sources sit in a repo it already has an EG branch on.  RHOAI has
+  # no stable EG branch on RHOAI-Build-Config, so the branch has to be made, and
+  # once it is made the PaC build is the natural thing to trigger from it.
+  #
+  # The whole block is serialised behind monitor-operator-build rather than run
+  # in parallel with Block 1.  It could clone earlier, but there is nothing to
+  # gain: update-group-snapshot cannot proceed without the operator digest, and
+  # a bundle built from a failed operator build is not a result anyone wants.
+
+  # DR-1a.  Resolves the latest rhoai-X.Y at run time rather than taking a
+  # pinned revision, and clones it read-only.  Every write below lands on the
+  # ephemeral branch forked from the commit this reports.
+  - name: clone-build-config
+    runAfter:
+    - monitor-operator-build
+    params:
+    - name: REPO_URL
+      value: $(params.build-config-repo-url)
+    - name: BRANCH_OVERRIDE
+      value: $(params.build-config-branch-override)
+    - name: ociStorage
+      value: $(params.bundle-output-image):eg-$(params.leader-pr-number).bundle
+    - name: ociArtifactExpiresAfter
+      value: $(params.image-expires-after)
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/clone-build-config-repo.yaml
+
+  # DR-1b.  Forked from clone-build-config's exact SHA, not from the branch
+  # name, so the ephemeral branch and the clone are the same tree even if
+  # rhoai-X.Y moves mid-run.
+  #
+  # The name is built from $(context.pipelineRun.uid), which is available in
+  # `finally` too.  That is the whole reason for choosing it over anything
+  # derived from a task result: the cleanup task has to be able to recompute
+  # this name on a run where an earlier task failed.
+  - name: fork-bundle-branch
+    runAfter:
+    - clone-build-config
+    params:
+    - name: repo
+      value: $(params.build-config-repo)
+    - name: source-sha
+      value: $(tasks.clone-build-config.results.release-sha)
+    - name: branch-name
+      value: eg-bundle-$(context.pipelineRun.uid)
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/create-ephemeral-branch.yaml
+
+  # DR-2.  The operator digest must be in the bundle inputs before processing
+  # begins, so this is its own task ahead of bundle-processor rather than a few
+  # inline jq/yq lines inside it the way upstream does it.
+  #
+  # It runs after the fork purely so that "all processing happens on the
+  # ephemeral branch" is true in sequence as well as in effect - nothing is
+  # written anywhere until the branch that will receive it exists.
+  - name: update-group-snapshot
+    runAfter:
+    - fork-bundle-branch
+    params:
+    - name: SOURCE_ARTIFACT
+      value: $(tasks.clone-build-config.results.SOURCE_ARTIFACT)
+    - name: SNAPSHOT_ARTIFACT
+      value: $(tasks.generate-snapshot.results.SNAPSHOT_ARTIFACT)
+    - name: OPERATOR_IMAGE_REF_BY_DIGEST
+      value: $(tasks.monitor-operator-build.results.image-ref-by-digest)
+    - name: OPERATOR_IMAGE_URL
+      value: $(tasks.monitor-operator-build.results.image-ref)
+    - name: OPERATOR_IMAGE_DIGEST
+      value: $(tasks.monitor-operator-build.results.image-digest)
+    - name: SNAPSHOT_OPERATOR_KEY
+      value: $(params.snapshot-operator-key)
+    - name: ociStorage
+      value: $(params.bundle-output-image):eg-$(params.leader-pr-number).bundle
+    - name: ociArtifactExpiresAfter
+      value: $(params.image-expires-after)
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/update-group-snapshot.yaml
+
+  # DR-3, DR-4, DR-5.  QUAY_TAG is Block 1's tag, wired through as a param and
+  # never defaulted to the release branch name.
+  #
+  # eg-<operator-commit> is the tag rhods-operator-gap-eg-push.yaml applies, and
+  # it is recomputed here from the processor commit rather than parsed back out
+  # of monitor-operator-build's image-ref: image-ref is <repo>:<tag>, and
+  # splitting a registry reference on ":" in a Tekton param expression is not
+  # something to do when the input to it is right here.
+  - name: bundle-processor
+    runAfter:
+    - update-group-snapshot
+    params:
+    - name: SOURCE_ARTIFACT
+      value: $(tasks.update-group-snapshot.results.SOURCE_ARTIFACT)
+    - name: QUAY_TAG
+      value: eg-$(tasks.monitor-operator-processor.results.processor-commit)
+    - name: OPERATOR_COMPONENT_NAME
+      value: $(tasks.update-group-snapshot.results.operator-component-name)
+    - name: USE_EXISTING_DIGESTS
+      value: "true"
+    - name: ociStorage
+      value: $(params.bundle-output-image):eg-$(params.leader-pr-number).bundle
+    - name: ociArtifactExpiresAfter
+      value: $(params.image-expires-after)
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/bundle-processor.yaml
+
+  # DR-6.  The gate's actual assertion.  Everything above this task proves the
+  # bundle can be built; this is what proves it was built from the right images.
+  # It runs before the push, so a bundle that would embed a release image never
+  # reaches git and never triggers a build.
+  - name: verify-bundle-images
+    runAfter:
+    - bundle-processor
+    params:
+    - name: SOURCE_ARTIFACT
+      value: $(tasks.bundle-processor.results.SOURCE_ARTIFACT)
+    - name: SNAPSHOT_ARTIFACT
+      value: $(tasks.generate-snapshot.results.SNAPSHOT_ARTIFACT)
+    - name: OPERATOR_IMAGE
+      value: $(tasks.update-group-snapshot.results.operator-image)
+    - name: RELEASE_BRANCH
+      value: $(tasks.clone-build-config.results.release-branch)
+    - name: STRICT_MODE
+      value: $(params.bundle-verify-strict)
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/verify-bundle-images.yaml
+
+  # DR-1c, DR-1d.  The only write to git in the whole block, and it goes to the
+  # ephemeral branch.  PaC picks the commit up and starts
+  # odh-operator-bundle-v3-6-eg-on-push.
+  - name: push-bundle-to-ephemeral-branch
+    runAfter:
+    - verify-bundle-images
+    params:
+    - name: SOURCE_ARTIFACT
+      value: $(tasks.bundle-processor.results.SOURCE_ARTIFACT)
+    - name: repo
+      value: $(params.build-config-repo)
+    - name: branch-name
+      value: $(tasks.fork-bundle-branch.results.branch-name)
+    - name: commit-message
+      value: "early-gate: pin bundle to gated digests for PR $(params.leader-pr-number)"
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/push-bundle-to-ephemeral-branch.yaml
+
+  # DR-7e.  Watches the PaC build and resolves the tag to a digest, which is
+  # what BUNDLE_IMAGE_REF_BY_DIGEST is built from.
+  - name: monitor-bundle-build
+    runAfter:
+    - push-bundle-to-ephemeral-branch
+    params:
+    - name: repo
+      value: $(params.build-config-repo)
+    - name: commit
+      value: $(tasks.push-bundle-to-ephemeral-branch.results.commit-sha)
+    - name: check-name
+      value: $(params.bundle-build-check-name)
+    - name: output-image
+      value: $(params.bundle-output-image)
+    - name: timeout-minutes
+      value: $(params.bundle-build-timeout-minutes)
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/monitor-pac-build.yaml
+
   finally:
 
   # fork-operator-branch always creates a branch, so something must always
@@ -907,3 +1260,38 @@ spec:
             404) echo "Branch ${BRANCH} not found - nothing to clean up" ;;
             *)   echo "Could not delete ${BRANCH} (HTTP ${CODE})" >&2 ;;
           esac
+
+  # DR-1e.  The same for Block 2's branch on RHOAI-Build-Config, which matters
+  # more than Block 1's: RHOAI-Build-Config is a shared release repository, and
+  # an orphan eg-bundle-* branch per gate run would accumulate there in public.
+  #
+  # As above, the branch name is recomputed - here from
+  # $(context.pipelineRun.uid), which is why fork-bundle-branch was given a
+  # name built from that and not from anything a task produced.  A finally task
+  # that references a failed task's result is skipped entirely, which is
+  # exactly the run whose branch most needs removing.
+  #
+  # Deleting it is safe because the build tags the image by commit
+  # (eg-<sha>, plus eg-bundle-<uid>-<sha> via additional-tags), and neither tag
+  # depends on the ref still existing.  DR-1f: set defer-bundle-branch-cleanup
+  # if Block 3 turns out to need the branch, and own the deletion yourself.
+  - name: cleanup-bundle-ephemeral-branch
+    params:
+    - name: repo
+      value: $(params.build-config-repo)
+    - name: branch-name
+      value: eg-bundle-$(context.pipelineRun.uid)
+    - name: defer-cleanup
+      value: $(params.defer-bundle-branch-cleanup)
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/cleanup-ephemeral-branch.yaml
