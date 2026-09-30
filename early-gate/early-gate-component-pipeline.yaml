@@ -1074,8 +1074,31 @@ spec:
       value: $(params.build-config-repo-url)
     - name: BRANCH_OVERRIDE
       value: $(params.build-config-branch-override)
+    # operator-output-image, not bundle-output-image, and the distinction is
+    # about credentials rather than about which image these artifacts describe.
+    #
+    # This whole PipelineRun runs as build-pipeline-rhods-operator-gap, the
+    # service account Konflux created for the rhods-operator-gap Component.
+    # Its registry push credential covers that Component's repository and no
+    # other.  rhoda-operator-bundle-gap belongs to a different Component with
+    # its own build-pipeline-rhoda-operator-bundle-gap, so writing a trusted
+    # artifact there fails at the upload:
+    #
+    #     Using token for quay.io/redhat-user-workloads/rhoai-tenant
+    #     Uploading b7aede9f2f1e SOURCE_ARTIFACT
+    #     Error response from registry: unauthorized: access to the requested
+    #     resource is not authorized: map[]
+    #
+    # Picking a different bundle repository would not help - the constraint is
+    # the service account, not the name.  Same lesson as the generate-snapshot
+    # comment above, one layer out: there the tag had to be explicit because
+    # the SA cannot create a repository, here the repository has to be the
+    # operator's because the SA cannot write to anyone else's.
+    #
+    # The .bundle tag suffix is kept so Block 2's artifacts stay distinct from
+    # Block 1's .snapshot ones inside the shared repository.
     - name: ociStorage
-      value: $(params.bundle-output-image):eg-$(params.leader-pr-number).bundle
+      value: $(params.operator-output-image):eg-$(params.leader-pr-number).bundle
     - name: ociArtifactExpiresAfter
       value: $(params.image-expires-after)
     taskRef:
@@ -1143,7 +1166,7 @@ spec:
     - name: SNAPSHOT_OPERATOR_KEY
       value: $(params.snapshot-operator-key)
     - name: ociStorage
-      value: $(params.bundle-output-image):eg-$(params.leader-pr-number).bundle
+      value: $(params.operator-output-image):eg-$(params.leader-pr-number).bundle
     - name: ociArtifactExpiresAfter
       value: $(params.image-expires-after)
     taskRef:
@@ -1177,7 +1200,7 @@ spec:
     - name: USE_EXISTING_DIGESTS
       value: "true"
     - name: ociStorage
-      value: $(params.bundle-output-image):eg-$(params.leader-pr-number).bundle
+      value: $(params.operator-output-image):eg-$(params.leader-pr-number).bundle
     - name: ociArtifactExpiresAfter
       value: $(params.image-expires-after)
     taskRef:
