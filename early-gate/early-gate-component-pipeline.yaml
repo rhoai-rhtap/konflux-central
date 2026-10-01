@@ -228,7 +228,21 @@ spec:
     default: "20"
   - name: build-timeout-minutes
     type: string
-    default: "90"
+    default: "150"
+    description: |
+      Must outlast the build it watches, not merely be a long-looking number.
+      The operator's EG build is the 4-arch hermetic one - x86_64, ppc64le,
+      s390x and arm64 through multi-arch-container-build.yaml, with a cachi2
+      prefetch - and .tekton/rhods-operator-gap-eg-push.yaml gives itself
+      timeouts.pipeline: 4h.  At 90 this task gave up at 13:33Z on a build
+      that had started at 12:01Z and was still legitimately running, and then
+      cleanup-ephemeral-branch deleted the branch out from under it.  A warm
+      cache can finish the same build in eight minutes, which is what made 90
+      look sufficient; a cold one does not.
+
+      150 rather than 240 because the launcher's own budget has to cover this
+      plus everything after it.  See the arithmetic on timeouts.pipeline in
+      .tekton/rhods-operator-gap-eg-build.yaml.
   - name: bundle-build-timeout-minutes
     type: string
     default: "60"
