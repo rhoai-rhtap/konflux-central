@@ -115,7 +115,15 @@ spec:
       import sys
       from pathlib import Path
 
-      import yaml
+      # Standard library only.  quay.io/rhoai/rhoai-task-toolset is a minimal
+      # image: it has python3 but no PyYAML, and `import yaml` aborted this task
+      # in 13 seconds before a single check ran.  verify-bundle-images.yaml, which
+      # runs green on the same image, is stdlib-only for the same reason.
+      #
+      # Nothing of value is lost.  The catalog was already being scanned with
+      # regex - splitting ~100 documents and matching schema/name - and the two
+      # fields this task reads out of the one matched document, `image` and
+      # `relatedImages`, are flat scalars in opm-rendered output.
 
       SOURCE = Path("/var/workdir/source")
       CATALOG = SOURCE / os.environ["CATALOG_PATH"].strip()
@@ -133,6 +141,49 @@ spec:
 
       def is_release_tag(tag):
           return tag in FORBIDDEN_TAGS or bool(FORBIDDEN_TAG_RE.match(tag))
+
+      def scalar(text):
+          return text.strip().strip("'\"")
+
+      def top_level_scalar(doc, key):
+          """Value of a column-0 key in a single YAML document.
+
+          Anchored at column 0, so it cannot match the same key nested under
+          properties: or inside the alm-examples block scalar - YAML requires
+          block content to be indented past its parent, so depth is unambiguous
+          from the left margin alone.
+          """
+          match = re.search(r"(?m)^" + re.escape(key) + r":[ \t]*(\S.*)$", doc)
+          return scalar(match.group(1)) if match else ""
+
+      def related_images(doc):
+          """The relatedImages list of an opm-rendered olm.bundle document.
+
+          Entries are flat two-key mappings - `- image: <ref>` then `  name:
+          <n>` - so a block slice plus two patterns reads them exactly.  The
+          block ends at the next column-0 key, which is how a YAML sequence
+          nested under a top-level key terminates.
+          """
+          header = re.search(r"(?m)^relatedImages:[ \t]*$", doc)
+          if not header:
+              return []
+
+          entries = []
+          for line in doc[header.end():].splitlines()[1:]:
+              if not line.strip():
+                  continue
+              # A column-0 character that is not the sequence dash is the next
+              # top-level key, e.g. the trailing `schema: olm.bundle`.
+              if not line[0].isspace() and not line.startswith("-"):
+                  break
+              item = re.match(r"^-[ \t]+([A-Za-z0-9_.-]+):[ \t]*(.*)$", line)
+              if item:
+                  entries.append({item.group(1): scalar(item.group(2))})
+                  continue
+              cont = re.match(r"^[ \t]+([A-Za-z0-9_.-]+):[ \t]*(.*)$", line)
+              if cont and entries:
+                  entries[-1][cont.group(1)] = scalar(cont.group(2))
+          return entries
 
       failures = []
       reports = []
@@ -179,15 +230,14 @@ spec:
           Path(os.environ["VERIFIED_RESULT"]).write_text("false")
           sys.exit(1)
 
-      bundle = yaml.safe_load(target_doc)
-      related = bundle.get("relatedImages") or []
+      related = related_images(target_doc)
       Path(os.environ["RELATED_COUNT_RESULT"]).write_text(str(len(related)))
 
       print(f"olm.bundle '{BUNDLE_NAME}' found, {len(related)} relatedImages")
       print(f"other olm.bundle entries in the catalog: {legacy_bundles}")
 
       # --- Check 2: it is exactly Block 2's bundle ---------------------------
-      actual_image = (bundle.get("image") or "").strip()
+      actual_image = top_level_scalar(target_doc, "image")
       if not BUNDLE_IMAGE:
           failures.append("BUNDLE_IMAGE is empty; cannot verify the bundle reference.")
       elif actual_image == BUNDLE_IMAGE:
