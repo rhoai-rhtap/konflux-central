@@ -237,7 +237,7 @@ spec:
       as.
   - name: fbc-openshift-version
     type: string
-    default: "v4.22"
+    default: "v4.19"
     description: |
       DR-F4.  Which catalog/<version>/ directory Block 3 regenerates.  One
       version rather than all four in config/build-config.yaml: each is a
@@ -248,6 +248,21 @@ spec:
       .tekton/rhoai-fbc-fragment-gap-push.yaml.  They are two halves of one
       decision - the pipeline regenerates one path and the build reads one path
       - and a mismatch builds a stale catalog while the gate passes on it.
+
+      v4.19, which is also what rhoai-fbc-fragment-v3-5-push.yaml builds, and
+      not the v4.22 this POC started on.  catalog/v4.22 in the gap fork does
+      not build at all: alpha, eus-2.25, fast, stable and stable-2.25 each
+      have two heads - rhods-operator.2.25.11 and rhods-operator.2.25.8 - and
+      `opm serve --cache-only` rejects the upgrade graph.  That breakage is in
+      the committed catalog, not introduced here; the regenerated copy changes
+      image references only.  v4.19, v4.20 and v4.21 are clean.
+
+      Note the knock-on: NUMERIC_OCP_VERSION in fbc-processor crosses
+      CSV_META_MIN_OCP_VERSION=420 between these two, so v4.19 renders the
+      bundle-object template where v4.22 rendered csv-metadata.  Both are
+      rendered unconditionally either way, so this changes which one is
+      committed, not whether the render succeeds - and it is the same choice
+      the release path makes for 4.19.
   - name: fbc-push-pipeline-component
     type: string
     default: "rhoai-fbc-fragment-gap"
