@@ -359,6 +359,13 @@ spec:
     value: $(tasks.monitor-bundle-build.results.image-ref-by-digest)
   - name: BUNDLE_BUILD_STATUS
     value: $(tasks.monitor-bundle-build.results.build-status)
+  # The Konflux UI PipelineRun for the bundle build, surfaced as a pipeline
+  # result so it is readable from the gate's own run without opening the task
+  # log.  Block 1's equivalent is still only in monitor-operator-build's log;
+  # folding that inline task into monitor-pac-build is the follow-up that fixes
+  # it in one place.
+  - name: BUNDLE_BUILD_URL
+    value: $(tasks.monitor-bundle-build.results.build-url)
   - name: BUNDLE_VERIFIED
     description: '"true" when every image in the bundle passed the DR-6 checks'
     value: $(tasks.verify-bundle-images.results.verified)
@@ -386,6 +393,8 @@ spec:
     value: $(tasks.monitor-fbc-build.results.image-ref-by-digest)
   - name: FBC_BUILD_STATUS
     value: $(tasks.monitor-fbc-build.results.build-status)
+  - name: FBC_BUILD_URL
+    value: $(tasks.monitor-fbc-build.results.build-url)
   - name: FBC_VERIFIED
     description: '"true" when the regenerated catalog passed the DR-F6 checks'
     value: $(tasks.verify-fbc-images.results.verified)
