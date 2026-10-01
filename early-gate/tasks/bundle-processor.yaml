@@ -343,17 +343,40 @@ spec:
       export DOCKER_CONFIG="${AUTH_DIR}"
       export REGISTRY_AUTH_FILE="${AUTH_DIR}/config.json"
 
-      # SBOM metadata config, if the branch carries one AND we can authenticate
-      # to the registry it reads from.  Skipping it is safe: -mc only appends
-      # <VAR>_UPSTREAM_VERSION env vars to the CSV deployment spec, it
+      # SBOM metadata config, if the branch carries one AND this image can
+      # actually read SBOMs off a registry.  Skipping it is safe: -mc only
+      # appends <VAR>_UPSTREAM_VERSION env vars to the CSV deployment spec, it
       # substitutes nothing, so the bundle is complete without them.  They also
       # describe release images that no gated PR can influence, so their
       # absence costs the gate no signal - whereas aborting here would cost it
       # everything.
+      #
+      # Two independent preconditions, and credentials are the weaker one.
+      # extract_sbom_metadata shells out to cosign and skopeo, and
+      # quay.io/rhoai/rhoai-task-toolset:latest ships neither:
+      #
+      #     $ podman run --rm quay.io/rhoai/rhoai-task-toolset:latest \
+      #         bash -c 'command -v cosign skopeo'
+      #     (both MISSING; python3, pip, git, jq present)
+      #
+      # get_package_info does not catch the resulting failure and
+      # extract_sbom_metadata does not catch its RuntimeError, so passing -mc
+      # here aborts the run within seconds no matter how good the credentials
+      # are.  Checking the tools first is therefore not belt-and-braces: it is
+      # the check that matters on this image.  If the toolset image ever gains
+      # cosign and skopeo, this branch starts passing -mc on its own.
       METADATA_CONFIG_PATH=${SOURCE}/bundle/metadata-config.yaml
       METADATA_CONFIG_FLAG=()
+      MISSING_SBOM_TOOLS=()
+      for tool in cosign skopeo; do
+        command -v "${tool}" >/dev/null 2>&1 || MISSING_SBOM_TOOLS+=("${tool}")
+      done
       if [ ! -f "${METADATA_CONFIG_PATH}" ]; then
         echo "No bundle/metadata-config.yaml on this branch; -mc not passed."
+      elif [ ${#MISSING_SBOM_TOOLS[@]} -gt 0 ]; then
+        echo "WARNING: bundle/metadata-config.yaml is present but this image has no" >&2
+        echo "${MISSING_SBOM_TOOLS[*]}. SBOM extraction needs them, so -mc is skipped;" >&2
+        echo "the CSV will not carry SBOM-derived *_UPSTREAM_VERSION env vars." >&2
       elif ! grep -q '"registry.redhat.io"' "${AUTH_DIR}/config.json"; then
         echo "WARNING: bundle/metadata-config.yaml is present but registry.redhat.io" >&2
         echo "credentials are not in the early-gate-secrets secret. Skipping -mc;" >&2
@@ -449,7 +472,27 @@ spec:
       # survive as a stale file.  Root-level files in bundle/ are permanent
       # configs (bundle-patch.yaml, Dockerfile, ...) and are left alone.  Same
       # convention, and same caveat, as process-operator-bundle.yaml.
-      find ${SOURCE}/bundle/ -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} \;
+      #
+      # A glob, not `find -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} \;`.
+      # quay.io/rhoai/rhoai-task-toolset:latest has no find and no xargs:
+      #
+      #     $ podman run --rm quay.io/rhoai/rhoai-task-toolset:latest \
+      #         bash -c 'command -v find xargs'
+      #     (both MISSING; sed, awk, grep, tr, cp, tar, curl, jq present)
+      #
+      # Under `set -e` that is exit 127 after the processor has already done
+      # all its work, which is what killed this task in early-gate run 4.
+      # dotglob so a hidden directory is not left behind; nullglob so an empty
+      # bundle/ does not leave the pattern unexpanded; both are scoped to a
+      # subshell so the rest of the script keeps default globbing.
+      (
+        shopt -s nullglob dotglob
+        for entry in "${SOURCE}"/bundle/*; do
+          if [ -d "${entry}" ]; then
+            rm -rf "${entry}"
+          fi
+        done
+      )
       cp -r ${RAW_INPUTS_DIR}/* ${SOURCE}/bundle/
 
       echo "Bundle processing complete. Contents of bundle/:"
