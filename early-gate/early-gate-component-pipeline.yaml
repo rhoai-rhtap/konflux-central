@@ -210,6 +210,60 @@ spec:
     default: "odh-operator-ci"
     description: Key under which the operator is recorded in config/snapshot.json
 
+  # --- FBC build (Block 3) ---
+  # Block 3 reuses build-config-repo and build-config-branch-override above:
+  # the catalog lives in the same repository as the bundle, and forking a second
+  # ephemeral branch off the same release SHA is the whole of the difference.
+  - name: fbc-output-image
+    type: string
+    # Must be public, for the same reason the bundle repository had to be:
+    # monitor-fbc-build resolves its digest through quay.io's anonymous registry
+    # v2 token, and against a private repository FBC_IMAGE_DIGEST and
+    # FBC_IMAGE_REF_BY_DIGEST come back empty while the monitor still passes.
+    default: "quay.io/redhat-user-workloads/rhoai-tenant/rhoai-fbc-fragment-gap"
+    description: |
+      Image repository, without a tag.  Deliberately not
+      quay.io/rhoai/rhoai-fbc-fragment: that is the release repository, and a
+      fragment assembled from unmerged PRs must not land in it under any tag.
+      Must match output-image in the build-config repo's
+      .tekton/rhoai-fbc-fragment-gap-push.yaml.
+  - name: fbc-build-check-name
+    type: string
+    default: "rhoai-fbc-fragment-gap-on-push"
+    description: |
+      Name of the PaC check-run to watch for the FBC fragment.  Must match the
+      PipelineRun name in the build-config repo's
+      .tekton/rhoai-fbc-fragment-gap-push.yaml, since that is what PaC reports
+      as.
+  - name: fbc-openshift-version
+    type: string
+    default: "v4.22"
+    description: |
+      DR-F4.  Which catalog/<version>/ directory Block 3 regenerates.  One
+      version rather than all four in config/build-config.yaml: each is a
+      separate ~41k-line render and a separate image build, and the gate is
+      proving the bundle can be catalogued at all.
+
+      This has to agree with path-context in
+      .tekton/rhoai-fbc-fragment-gap-push.yaml.  They are two halves of one
+      decision - the pipeline regenerates one path and the build reads one path
+      - and a mismatch builds a stale catalog while the gate passes on it.
+  - name: fbc-push-pipeline-component
+    type: string
+    default: "rhoai-fbc-fragment-gap"
+    description: |
+      Basename of the PaC PipelineRun file in the build-config repo's .tekton/,
+      which fbc-processor is pointed at with --push-pipeline-yaml-path.  Passed
+      because fbc_processor.__init__ opens the file unconditionally, not because
+      an early-gate run wants to enable a release push pipeline.
+  - name: defer-fbc-branch-cleanup
+    type: string
+    default: "false"
+    description: |
+      Leave Block 3's ephemeral branch in place instead of deleting it, for
+      inspecting a generated catalog after the fact.  Whoever sets this owns
+      deleting the branch.
+
   # --- Self-reference ---
   - name: konflux-central-revision
     type: string
@@ -250,6 +304,15 @@ spec:
       Shorter than the operator's.  The bundle is FROM scratch with no compile
       step and no multi-arch fan-out, so an hour is generous; a bundle build
       still running after that is stuck, not slow.
+  - name: fbc-build-timeout-minutes
+    type: string
+    default: "90"
+    description: |
+      Longer than the bundle's.  An FBC fragment is single-arch and has no
+      compile step either, but it does pull a ~1GB
+      registry.redhat.io/openshift4/ose-operator-registry-rhel9 base and run
+      `opm serve --cache-only` over a catalog with eighty-odd bundles in it, and
+      it queues behind everything else the gate has already started.
 
   results:
   - name: EG_BRANCH
@@ -299,6 +362,33 @@ spec:
   - name: BUNDLE_VERIFIED
     description: '"true" when every image in the bundle passed the DR-6 checks'
     value: $(tasks.verify-bundle-images.results.verified)
+
+  # --- Block 3 outputs (DR-F7) ---
+  # The end of the chain.  FBC_IMAGE_REF_BY_DIGEST is what a cluster-level smoke
+  # test would install the catalog from, and like Block 2's results these are
+  # pipeline results rather than internal state so that something outside this
+  # PipelineRun can reach them.
+  - name: EG_FBC_BRANCH
+    value: $(tasks.fork-fbc-branch.results.branch-name)
+  - name: FBC_CATALOG_PATH
+    description: Repo-relative path of the catalog Block 3 regenerated
+    value: $(tasks.fbc-processor.results.catalog-path)
+  - name: FBC_BUNDLE_NAME
+    description: olm.bundle name the regenerated catalog carries
+    value: $(tasks.fbc-processor.results.bundle-name)
+  - name: FBC_COMMIT
+    value: $(tasks.push-fbc-to-ephemeral-branch.results.commit-sha)
+  - name: FBC_IMAGE_URL
+    value: $(tasks.monitor-fbc-build.results.image-ref)
+  - name: FBC_IMAGE_DIGEST
+    value: $(tasks.monitor-fbc-build.results.image-digest)
+  - name: FBC_IMAGE_REF_BY_DIGEST
+    value: $(tasks.monitor-fbc-build.results.image-ref-by-digest)
+  - name: FBC_BUILD_STATUS
+    value: $(tasks.monitor-fbc-build.results.build-status)
+  - name: FBC_VERIFIED
+    description: '"true" when the regenerated catalog passed the DR-F6 checks'
+    value: $(tasks.verify-fbc-images.results.verified)
 
   workspaces:
   - name: github-credentials
@@ -1324,6 +1414,194 @@ spec:
       - name: pathInRepo
         value: early-gate/tasks/monitor-pac-build.yaml
 
+  # ======================= Block 3: FBC fragment =========================
+  #
+  # No clone task of its own.  Block 2's clone-build-config already produced a
+  # clean artifact of the release branch, and the FBC reads catalog/ and
+  # config/, which bundle processing never touches - so Block 3 consumes that
+  # same artifact instead of cloning the repository a second time and pushing a
+  # second copy of it into the registry.  The tree is right by construction:
+  # fork-fbc-branch forks from the same release-sha the artifact was taken at.
+
+  # DR-F1.  A second ephemeral branch, not a reuse of Block 2's.
+  #
+  # defer-bundle-branch-cleanup exists so Block 3 could have forked from the
+  # bundle branch, and the tree would have been fine.  The trigger would not
+  # have been: the bundle PipelineRun fires on target_branch.startsWith(
+  # "eg-bundle-") with an "early-gate:" subject, which is exactly the shape of
+  # Block 3's catalog push, so sharing the branch would rebuild the bundle on
+  # every FBC push.  A separate prefix makes the two triggers disjoint by
+  # construction instead of by careful path matching.
+  #
+  # The name is built from $(context.pipelineRun.uid) for the same reason
+  # fork-bundle-branch's is: it is the one thing the finally cleanup can
+  # recompute on a run where an earlier task failed.
+  - name: fork-fbc-branch
+    runAfter:
+    - monitor-bundle-build
+    params:
+    - name: repo
+      value: $(params.build-config-repo)
+    - name: source-sha
+      value: $(tasks.clone-build-config.results.release-sha)
+    - name: branch-name
+      value: eg-fbc-$(context.pipelineRun.uid)
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/create-ephemeral-branch.yaml
+
+  # DR-F2, DR-F3.  The bundle arrives by digest from monitor-bundle-build, which
+  # is the same pair of results DR-7 publishes - Block 3 is the first consumer
+  # of the handoff Block 2 was built to produce, and it fails loudly if the
+  # digest is empty rather than rendering the template's placeholder.
+  #
+  # QUAY_TAG is Block 1's tag, wired through the same way bundle-processor's is
+  # and recomputed from the processor commit for the same reason.  It reaches
+  # only the tolerated snapshot lookup; the bundle the catalog is actually built
+  # around is BUNDLE_IMAGE_URL@BUNDLE_IMAGE_DIGEST.
+  - name: fbc-processor
+    runAfter:
+    - fork-fbc-branch
+    params:
+    - name: SOURCE_ARTIFACT
+      value: $(tasks.clone-build-config.results.SOURCE_ARTIFACT)
+    - name: BUNDLE_IMAGE_URL
+      value: $(tasks.monitor-bundle-build.results.image-ref)
+    - name: BUNDLE_IMAGE_DIGEST
+      value: $(tasks.monitor-bundle-build.results.image-digest)
+    - name: QUAY_TAG
+      value: eg-$(tasks.monitor-operator-processor.results.processor-commit)
+    - name: BRANCH
+      value: $(tasks.fork-fbc-branch.results.branch-name)
+    - name: OPENSHIFT_VERSION
+      value: $(params.fbc-openshift-version)
+    - name: FBC_PUSH_PIPELINE_COMPONENT
+      value: $(params.fbc-push-pipeline-component)
+    # .fbc, alongside Block 1's .snapshot and Block 2's .bundle, and in the
+    # operator's repository for the same reason: this PipelineRun runs as
+    # build-pipeline-rhods-operator-gap, whose registry credential covers that
+    # Component's repository and no other.
+    - name: ociStorage
+      value: $(params.operator-output-image):eg-$(params.leader-pr-number).fbc
+    - name: ociArtifactExpiresAfter
+      value: $(params.image-expires-after)
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/fbc-processor.yaml
+
+  # DR-F6.  Block 3's assertion, and the end-to-end one: Block 1's operator
+  # digest, routed through Block 2's bundle, visible in Block 3's catalog.  It
+  # runs before the push, so a catalog that still names the release bundle never
+  # reaches git and never triggers a build.
+  - name: verify-fbc-images
+    runAfter:
+    - fbc-processor
+    params:
+    - name: SOURCE_ARTIFACT
+      value: $(tasks.fbc-processor.results.SOURCE_ARTIFACT)
+    - name: CATALOG_PATH
+      value: $(tasks.fbc-processor.results.catalog-path)
+    - name: BUNDLE_NAME
+      value: $(tasks.fbc-processor.results.bundle-name)
+    - name: BUNDLE_IMAGE
+      value: $(tasks.fbc-processor.results.fbc-bundle-image)
+    - name: OPERATOR_IMAGE
+      value: $(tasks.update-group-snapshot.results.operator-image)
+    - name: RELEASE_BRANCH
+      value: $(tasks.clone-build-config.results.release-branch)
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/verify-fbc-images.yaml
+
+  # DR-F1.  Block 3's only write to git, and it goes to the ephemeral branch.
+  #
+  # push-bundle-to-ephemeral-branch, reused rather than copied: the task is
+  # already generic - repo, branch, message and paths are all params and nothing
+  # in it knows what a bundle is - and its three structural guarantees (it
+  # pushes only to the branch it cloned, it re-checks the eg-* prefix because it
+  # is the task holding a write token, and it has no force flag) are exactly the
+  # ones Block 3 needs.  Only the file name still says "bundle".
+  #
+  # paths is narrowed to catalog/.  config/ is Block 2's concern and .tekton/ is
+  # unchanged here: --push-pipeline-operation enable is a no-op when the file
+  # carries no disable marker, which the early-gate PipelineRun does not.
+  - name: push-fbc-to-ephemeral-branch
+    runAfter:
+    - verify-fbc-images
+    params:
+    - name: SOURCE_ARTIFACT
+      value: $(tasks.fbc-processor.results.SOURCE_ARTIFACT)
+    - name: repo
+      value: $(params.build-config-repo)
+    - name: branch-name
+      value: $(tasks.fork-fbc-branch.results.branch-name)
+    - name: paths
+      value: "catalog"
+    - name: commit-message
+      value: "early-gate: catalog $(tasks.fbc-processor.results.bundle-name) at gated bundle digest for PR $(params.leader-pr-number)"
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/push-bundle-to-ephemeral-branch.yaml
+
+  # DR-F7.  Watches the PaC build and resolves the tag to a digest, which is
+  # what FBC_IMAGE_REF_BY_DIGEST is built from.
+  - name: monitor-fbc-build
+    runAfter:
+    - push-fbc-to-ephemeral-branch
+    params:
+    - name: repo
+      value: $(params.build-config-repo)
+    - name: commit
+      value: $(tasks.push-fbc-to-ephemeral-branch.results.commit-sha)
+    - name: check-name
+      value: $(params.fbc-build-check-name)
+    - name: output-image
+      value: $(params.fbc-output-image)
+    - name: timeout-minutes
+      value: $(params.fbc-build-timeout-minutes)
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/monitor-pac-build.yaml
+
   finally:
 
   # fork-operator-branch always creates a branch, so something must always
@@ -1397,6 +1675,39 @@ spec:
       value: eg-bundle-$(context.pipelineRun.uid)
     - name: defer-cleanup
       value: $(params.defer-bundle-branch-cleanup)
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/cleanup-ephemeral-branch.yaml
+
+  # DR-F1.  The same for Block 3's branch, and for the same reason: an orphan
+  # eg-fbc-* branch per gate run would accumulate in a shared release
+  # repository, in public.
+  #
+  # Recomputed from $(context.pipelineRun.uid) rather than taken from
+  # fork-fbc-branch's result, because a finally task that references a failed
+  # task's result is skipped entirely - which is exactly the run whose branch
+  # most needs removing.
+  #
+  # Deleting it is safe: the build tags the image by commit (eg-<sha>, plus
+  # eg-fbc-<uid>-<sha> via additional-tags), and neither tag depends on the ref
+  # still existing.
+  - name: cleanup-fbc-ephemeral-branch
+    params:
+    - name: repo
+      value: $(params.build-config-repo)
+    - name: branch-name
+      value: eg-fbc-$(context.pipelineRun.uid)
+    - name: defer-cleanup
+      value: $(params.defer-fbc-branch-cleanup)
     workspaces:
     - name: github-credentials
       workspace: github-credentials
