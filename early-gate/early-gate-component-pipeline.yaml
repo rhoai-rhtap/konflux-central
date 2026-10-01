@@ -1613,6 +1613,12 @@ spec:
       value: $(params.fbc-output-image)
     - name: timeout-minutes
       value: $(params.fbc-build-timeout-minutes)
+    # DR-F7.  Block 3 is the end of the chain, so FBC_IMAGE_DIGEST and
+    # FBC_IMAGE_REF_BY_DIGEST are the run's deliverable rather than an input to
+    # something that would check them.  An empty digest here has to be a
+    # failure; run 13 went green with both empty.
+    - name: require-digest
+      value: "true"
     workspaces:
     - name: github-credentials
       workspace: github-credentials

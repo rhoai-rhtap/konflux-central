@@ -48,6 +48,21 @@ spec:
   - name: timeout-minutes
     type: string
     default: "60"
+  - name: require-digest
+    type: string
+    default: "false"
+    description: |
+      Whether an unresolvable digest fails this task.
+
+      "false" for a block whose digest feeds a later block: that block applies
+      its own contract - update-group-snapshot refuses a Block 1 reference that
+      is not digest-pinned rather than building on a tag - so warning here and
+      letting the chain enforce it keeps the diagnosis where the decision is.
+
+      "true" for the last block in the chain, where there is no later block to
+      enforce anything and the digest IS the deliverable. Run 13's FBC build
+      succeeded, the gate reported success, and FBC_IMAGE_DIGEST came back
+      empty: green on a run that produced no usable output.
   results:
   - name: build-status
     description: success, failure, or timeout
@@ -197,12 +212,23 @@ spec:
               echo "Digest: ${DIGEST}"
               echo -n "${DIGEST}" > $(results.image-digest.path)
               echo -n "${IMAGE_REF%:*}@${DIGEST}" > $(results.image-ref-by-digest.path)
+            elif [ "$(params.require-digest)" = "true" ]; then
+              # Terminal block: nothing downstream will catch this, and the
+              # digest is the deliverable. Reporting success here is a false
+              # green - run 13 did exactly that.
+              echo "Build succeeded but ${IMAGE_REF} did not resolve to a digest." >&2
+              echo "require-digest is true, so this is a failure: the run has no usable output." >&2
+              echo "Check that the build publishes this exact tag. A multi-platform" >&2
+              echo "pipeline only tags <tag>-<platform> unless build-image-index is true," >&2
+              echo "in which case the plain tag never exists." >&2
+              echo -n "failure" > $(results.build-status.path)
+              exit 1
             else
-              # Not fatal for Block 2's own verdict: the gate's question is
-              # whether the bundle builds, and it did. Block 3 gets an empty
-              # digest and decides for itself whether it can proceed - the same
-              # contract update-group-snapshot enforces on Block 1's digest,
-              # where it refuses to build a bundle that floats on a tag.
+              # Not fatal for a block that feeds another: the gate's question is
+              # whether the bundle builds, and it did. The next block decides for
+              # itself whether it can proceed - the same contract
+              # update-group-snapshot enforces on Block 1's digest, where it
+              # refuses to build a bundle that floats on a tag.
               echo "WARNING: build succeeded but ${IMAGE_REF} did not resolve to a digest" >&2
             fi
             exit 0
