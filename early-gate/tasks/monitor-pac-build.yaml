@@ -43,8 +43,19 @@ spec:
     type: string
     default: ""
     description: |
-      Tag the build applies. Empty means "eg-<commit>", which is the convention
-      every early-gate PipelineRun uses.
+      Tag the build applies.  Required.
+
+      This used to default to "eg-<commit>", reconstructed below, back when each
+      block pushed to a repository of its own and the tag only had to identify
+      the commit.  All three now share quay.io/rhoai/pull-request-pipelines and
+      are told apart by a component prefix on the tag - which this task cannot
+      derive, since nothing it is given says which component it is watching.
+
+      So the reconstruction is gone and an empty value is an error.  The
+      alternative was to keep the old fallback, which would now resolve a tag
+      that no build ever pushes: the task would poll a nonexistent manifest
+      until it timed out, or - with require-digest false - pass with an empty
+      digest, which is precisely the DR-F7 failure run 13 went green on.
   - name: timeout-minutes
     type: string
     default: "60"
@@ -100,8 +111,18 @@ spec:
       REPO="$(params.repo)"
       SHA="$(params.commit)"
       CHECK="$(params.check-name)"
+      # No "eg-${SHA}" fallback any more - see the image-tag param description.
+      # Failing here is deliberate: the fallback could only ever name a tag no
+      # build pushes, and the symptom would be a timeout or an empty digest
+      # rather than anything pointing back at this line.
       TAG="$(params.image-tag)"
-      [ -n "${TAG}" ] || TAG="eg-${SHA}"
+      if [ -z "${TAG}" ]; then
+        echo "ERROR: image-tag is empty." >&2
+        echo "  Pass the full tag the build applies, component prefix included," >&2
+        echo "  e.g. rhods-operator-eg-<leader-pr>-<sha>.  It must match" >&2
+        echo "  output-image in the PaC PipelineRun this task is watching." >&2
+        exit 1
+      fi
 
       TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
 
