@@ -90,11 +90,19 @@ spec:
   # --- Operator build ---
   - name: operator-output-image
     type: string
-    default: "quay.io/redhat-user-workloads/rhoai-tenant/rhods-operator-gap"
+    # All three blocks now publish into this one repository, distinguished by a
+    # component prefix on the tag rather than by the repository name.  It is
+    # public, which monitor-pac-build requires - it resolves digests through
+    # quay.io's anonymous registry v2 token - and it is already where RHOAI
+    # puts non-release build artifacts.  Every quay.io/rhoai release repository
+    # (odh-operator, odh-operator-bundle, rhoai-fbc-fragment) answers that token
+    # with 401, so none of them is usable here even leaving aside the rule that
+    # artifacts built from unmerged PRs must not land in a release repository.
+    default: "quay.io/rhoai/pull-request-pipelines"
     description: |
-      Image repository, without a tag.  The EG build tags by commit, so the
-      tag is derived from what operator-processor actually pushed rather
-      than being passed in.
+      Image repository, without a tag.  The EG build tags by component and
+      commit, so the tag is derived from what operator-processor actually
+      pushed rather than being passed in.
   - name: fallback-source-branch
     type: string
     default: "stable"
@@ -180,26 +188,23 @@ spec:
       earlier run, or to gate against a branch that is not yet the newest.
   - name: bundle-output-image
     type: string
-    # rhod-, not rhoda- and not odh-.  Two Components are bound to the
-    # build-config repository; the one that works here is the public one.
-    # monitor-bundle-build resolves its digest through quay.io's anonymous
-    # registry v2 token - the one lookup in the chain that takes no
-    # credential - and rhoda-'s repository is private:
+    # Must be a PUBLIC repository.  monitor-bundle-build resolves its digest
+    # through quay.io's anonymous registry v2 token - the one lookup in the
+    # chain that takes no credential - and against a private repository the
+    # failure is quiet: the build succeeds, the monitor warns rather than
+    # fails, and BUNDLE_IMAGE_DIGEST and BUNDLE_IMAGE_REF_BY_DIGEST come back
+    # empty, which is the whole of DR-7, the handoff Block 3 consumes.
     #
-    #     rhoda-operator-bundle-gap   manifests/<tag> -> 401
-    #     rhod-operator-bundle-gap    manifests/<tag> -> 404 (public)
-    #
-    # The failure would be quiet: the build succeeds, the monitor warns
-    # rather than fails, and BUNDLE_IMAGE_DIGEST and
-    # BUNDLE_IMAGE_REF_BY_DIGEST come back empty - which is the whole of
-    # DR-7, the handoff Block 3 consumes.
-    default: "quay.io/redhat-user-workloads/rhoai-tenant/rhod-operator-bundle-gap"
+    # quay.io/rhoai/odh-operator-bundle answers that token with 401, so it is
+    # unusable here quite apart from being the release repository.
+    default: "quay.io/rhoai/pull-request-pipelines"
     description: |
       Image repository, without a tag.  Deliberately not
       quay.io/rhoai/odh-operator-bundle: that is the release repository, and a
       bundle assembled from unmerged PRs must not land in it under any tag.
-      Must match output-image in the build-config repo's
-      .tekton/rhod-operator-bundle-gap-push.yaml.
+      Shared with the operator and FBC blocks; the component is carried by the
+      tag prefix, not the repository name.  Must match output-image in the
+      build-config repo's .tekton/rhod-operator-bundle-gap-push.yaml.
   - name: bundle-build-check-name
     type: string
     default: "rhod-operator-bundle-gap-on-push"
@@ -240,13 +245,15 @@ spec:
     # monitor-fbc-build resolves its digest through quay.io's anonymous registry
     # v2 token, and against a private repository FBC_IMAGE_DIGEST and
     # FBC_IMAGE_REF_BY_DIGEST come back empty while the monitor still passes.
-    default: "quay.io/redhat-user-workloads/rhoai-tenant/rhoai-fbc-fragment-gap"
+    # quay.io/rhoai/rhoai-fbc-fragment answers that token with 401.
+    default: "quay.io/rhoai/pull-request-pipelines"
     description: |
       Image repository, without a tag.  Deliberately not
       quay.io/rhoai/rhoai-fbc-fragment: that is the release repository, and a
       fragment assembled from unmerged PRs must not land in it under any tag.
-      Must match output-image in the build-config repo's
-      .tekton/rhoai-fbc-fragment-gap-push.yaml.
+      Shared with the operator and bundle blocks; the component is carried by
+      the tag prefix, not the repository name.  Must match output-image in the
+      build-config repo's .tekton/rhoai-fbc-fragment-gap-push.yaml.
   - name: fbc-build-check-name
     type: string
     default: "rhoai-fbc-fragment-gap-on-push"
@@ -1008,6 +1015,17 @@ spec:
       value: $(params.build-check-name)
     - name: output-image
       value: $(params.operator-output-image)
+    # Passed explicitly rather than left empty for monitor-pac-build to
+    # reconstruct.  Its fallback built "eg-<sha>", which was right only while
+    # each block owned a private repository; now that all three share
+    # pull-request-pipelines the component prefix is what separates them, and
+    # the task has no way to know which component it is watching.
+    #
+    # This must stay character-for-character equal to output-image in the
+    # operator repo's .tekton/rhods-operator-gap-eg-push.yaml, which resolves
+    # '{{target_branch}}-{{revision}}' against the same branch and commit.
+    - name: image-tag
+      value: rhods-operator-$(tasks.fork-operator-branch.results.branch-name)-$(tasks.monitor-operator-processor.results.processor-commit)
     - name: timeout-minutes
       value: $(params.build-timeout-minutes)
     workspaces:
@@ -1449,6 +1467,11 @@ spec:
       value: $(params.bundle-build-check-name)
     - name: output-image
       value: $(params.bundle-output-image)
+    # See monitor-operator-build for why this is passed rather than
+    # reconstructed.  Must stay equal to output-image in the build-config
+    # repo's .tekton/rhod-operator-bundle-gap-push.yaml.
+    - name: image-tag
+      value: odh-operator-bundle-$(tasks.fork-bundle-branch.results.branch-name)-$(tasks.push-bundle-to-ephemeral-branch.results.commit-sha)
     - name: timeout-minutes
       value: $(params.bundle-build-timeout-minutes)
     workspaces:
@@ -1637,6 +1660,15 @@ spec:
       value: $(params.fbc-build-check-name)
     - name: output-image
       value: $(params.fbc-output-image)
+    # See monitor-operator-build for why this is passed rather than
+    # reconstructed.  Must stay equal to output-image in the build-config
+    # repo's .tekton/rhoai-fbc-fragment-gap-push.yaml.
+    #
+    # This is the plain tag, the one build-image-index puts on the index.  The
+    # per-platform manifests buildah pushes alongside it carry a
+    # -linux-<arch> suffix and are not what require-digest below resolves.
+    - name: image-tag
+      value: rhoai-fbc-fragment-$(tasks.fork-fbc-branch.results.branch-name)-$(tasks.push-fbc-to-ephemeral-branch.results.commit-sha)
     - name: timeout-minutes
       value: $(params.fbc-build-timeout-minutes)
     # DR-F7.  Block 3 is the end of the chain, so FBC_IMAGE_DIGEST and
