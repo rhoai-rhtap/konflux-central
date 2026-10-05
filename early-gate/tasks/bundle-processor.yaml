@@ -261,8 +261,13 @@ spec:
         echo "QUAY_TAG is empty. It must be set explicitly to Block 1's operator tag." >&2
         exit 1
       fi
+      # Whole-string shell globs, not substring tests, so a tag that merely
+      # contains one of these words is unaffected: "latest" is rejected,
+      # "my-latest-build" is not.  `stable` is in the list to match
+      # fbc-processor.yaml and verify-*-images' FORBIDDEN_TAG_RE, which have
+      # always had it; its absence here was an inconsistency, not a decision.
       case "${QUAY_TAG}" in
-        rhoai-*|odh-stable|latest|*-nightly)
+        rhoai-*|odh-stable|latest|stable|*-nightly)
           echo "QUAY_TAG='${QUAY_TAG}' looks like a release tag." >&2
           echo "An early-gate run must look images up by its own tag, never the release one (DR-3d)." >&2
           exit 1

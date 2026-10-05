@@ -99,6 +99,26 @@ spec:
     type: string
     default: "stable"
     description: Branch to fork from when the leader PR cannot be read
+  - name: operator-source-branch
+    type: string
+    default: "main"
+    description: |
+      Branch to fork from when the leader PR includes the operator repo, i.e.
+      the branch that operator PR lands on.
+  - name: triggering-branch
+    type: string
+    default: ""
+    description: |
+      The branch this gate run was triggered on.  Wire it to PaC's
+      '{{target_branch}}' in the calling PipelineRun.
+
+      Empty - the default - preserves the original behaviour exactly, where
+      the fork point is always operator-source-branch or
+      fallback-source-branch.  Set, and naming anything other than those two,
+      it makes the run fork from the branch under test.  Without it a gate run
+      from a PR on a dev branch forks from main or stable and gates code the
+      PR does not contain, which is worse than not running at all: it reports
+      green for something it never built.
   - name: allowed-child-orgs
     type: string
     default: "rhoai-rhtap red-hat-data-services"
@@ -492,8 +512,14 @@ spec:
     # when the leader PR cannot be read at all.
     - name: operator-repo-name
       value: $(params.operator-repo)
+    - name: operator-source-branch
+      value: $(params.operator-source-branch)
     - name: fallback-source-branch
       value: $(params.fallback-source-branch)
+    # The branch the gate run was triggered on.  Lets a PR against any branch
+    # fork from that branch instead of from main or stable.
+    - name: triggering-branch
+      value: $(params.triggering-branch)
     - name: allowed-orgs
       value: $(params.allowed-child-orgs)
     workspaces:

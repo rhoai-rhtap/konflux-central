@@ -38,15 +38,20 @@ spec:
   - name: SOURCE_ARTIFACT
     description: Trusted artifact holding the RHOAI-Build-Config working tree
   - name: release-branch
-    description: The rhoai-X.Y branch that was resolved and cloned
+    description: |
+      The branch that was resolved and cloned - a discovered rhoai-X.Y, or
+      whatever BRANCH_OVERRIDE named.
   - name: release-sha
     description: Head commit of that branch, and the point the ephemeral branch forks from
   - name: rhoai-version
-    description: The X.Y portion of release-branch, e.g. 3.6
+    description: |
+      The X.Y portion of release-branch, e.g. 3.6.  Empty when release-branch
+      is not a rhoai-X.Y branch, which is the normal case under BRANCH_OVERRIDE.
   - name: component-suffix
     description: |
       The vX-Y form used in RHOAI component and .tekton file names, e.g. v3-6.
       Derived here so no downstream task has to re-parse the branch name.
+      Empty under the same condition as rhoai-version.
   volumes:
   - name: workdir
     emptyDir: {}
@@ -100,8 +105,30 @@ spec:
       git clone --depth 1 --branch "${BRANCH}" "${REPO_URL}" /var/workdir/source
       SHA=$(git -C /var/workdir/source rev-parse HEAD)
 
-      VERSION="${BRANCH#rhoai-}"
-      SUFFIX="v${VERSION//./-}"
+      # Only meaningful for a rhoai-X.Y branch.  ${BRANCH#rhoai-} is a no-op on
+      # anything else, so with BRANCH_OVERRIDE=gap-poc these used to come out as
+      # version "gap-poc" and suffix "vgap-poc", and on a branch with a slash in
+      # it the suffix would have carried the slash into what reads like a
+      # component name.  Nothing consumes either result today - the pipeline
+      # uses release-branch, release-sha and SOURCE_ARTIFACT only - so this was
+      # latent rather than broken, and the point of emptying them is that a
+      # future consumer gets nothing instead of getting nonsense.
+      # The test is the rhoai- prefix, not the stricter ^[23]\.[0-9]+$ the
+      # discovery above applies.  Discovery decides which branch is a valid
+      # gate target; this only decides whether stripping the prefix produces a
+      # version, and it does for every rhoai-* branch - rhoai-3.5-ea.1 gives
+      # 3.5-ea.1 and v3-5-ea-1, exactly as before.  Being stricter here would
+      # change behaviour for BRANCH_OVERRIDE=rhoai-3.5-ea.1, which is a real
+      # way to reproduce an old run and is none of this block's business.
+      if [ "${BRANCH}" != "${BRANCH#rhoai-}" ]; then
+        VERSION="${BRANCH#rhoai-}"
+        SUFFIX="v${VERSION//./-}"
+      else
+        VERSION=""
+        SUFFIX=""
+        echo "NOTE: ${BRANCH} is not a rhoai-* branch; rhoai-version and" \
+             "component-suffix are left empty rather than echoing the branch name."
+      fi
 
       echo "  branch  ${BRANCH}"
       echo "  sha     ${SHA}"

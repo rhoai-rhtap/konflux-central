@@ -58,11 +58,38 @@ spec:
       default: "rhoai-rhtap/rhods-operator-gap"
       description: |
         org/repo of the operator.  When the leader PR references it, the
-        operator source is itself changing and source-branch resolves to main.
+        operator source is itself changing and source-branch resolves to
+        operator-source-branch.
+    - name: operator-source-branch
+      type: string
+      default: "main"
+      description: |
+        Branch to fork from when the leader PR includes the operator repo - the
+        branch that PR lands on.  A parameter rather than the literal "main" it
+        used to be, so that a deployment whose operator development branch is
+        named something else does not have to patch this task.
     - name: fallback-source-branch
       type: string
       default: "stable"
       description: Branch to fork from when the leader PR cannot be read
+    - name: triggering-branch
+      type: string
+      default: ""
+      description: |
+        The branch the gate run was triggered on - PaC's {{target_branch}},
+        passed down by the caller.  Empty keeps the historical behaviour.
+
+        When this names a branch that is neither operator-source-branch nor
+        fallback-source-branch, it wins outright and the operator-PR heuristic
+        below is skipped.  That heuristic answers "which of our two long-lived
+        branches holds the operator source for this group" - a question that
+        has no meaning on a dev branch, where the only sensible fork point is
+        the branch under test itself.  Forking from main or stable there would
+        gate code the PR does not contain, and report green for it.
+
+        It is deliberately not a blanket override: on main and stable the
+        heuristic still decides, because there the fork point genuinely depends
+        on whether the operator is one of the components changing.
     - name: allowed-orgs
       type: string
       default: "rhoai-rhtap"
@@ -85,7 +112,10 @@ spec:
     - name: format-help-warning
       description: Helpful message when earlygate is mentioned incorrectly or PR URLs found outside section
     - name: source-branch
-      description: Branch to fork the ephemeral branch from - main or stable
+      description: |
+        Branch to fork the ephemeral branch from.  operator-source-branch or
+        fallback-source-branch when the run was triggered on one of those;
+        otherwise the triggering branch itself.
     - name: operator-pr-included
       description: true when the leader PR references the operator repo
     - name: component-count
@@ -120,6 +150,10 @@ spec:
           value: $(params.operator-repo-name)
         - name: FALLBACK_SOURCE_BRANCH
           value: $(params.fallback-source-branch)
+        - name: OPERATOR_SOURCE_BRANCH
+          value: $(params.operator-source-branch)
+        - name: TRIGGERING_BRANCH
+          value: $(params.triggering-branch)
         - name: ALLOWED_ORGS
           value: $(params.allowed-orgs)
         - name: WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND
@@ -135,13 +169,31 @@ spec:
         # not a degraded snapshot, it is a dead pipeline.  Writing defaults
         # first means every subsequent path - including the ones that give up
         # early - leaves a complete, readable set of results behind.
-        echo -n "{}"                        > "$(results.group-components.path)"
-        echo -n "false"                     > "$(results.has-group-config.path)"
-        echo -n ""                          > "$(results.invalid-repo-warnings.path)"
-        echo -n ""                          > "$(results.format-help-warning.path)"
-        echo -n "${FALLBACK_SOURCE_BRANCH}" > "$(results.source-branch.path)"
-        echo -n "false"                     > "$(results.operator-pr-included.path)"
-        echo -n "0"                         > "$(results.component-count.path)"
+        # Which branch a run that never gets as far as decide_fork_source forks
+        # from.  On a dev branch that has to be the dev branch, not the
+        # fallback: an unreadable leader PR is a reason to stop guessing about
+        # the *group*, not a reason to go and gate stable instead of the branch
+        # the run was triggered on.
+        # Carried as its own flag, not inferred later by comparing
+        # DEFAULT_SOURCE_BRANCH to TRIGGERING_BRANCH: those two are equal when
+        # the run was triggered on the fallback branch itself, and that
+        # comparison would then take the dev-branch path on stable.
+        TRIGGER_IS_DEV_BRANCH="no"
+        DEFAULT_SOURCE_BRANCH="${FALLBACK_SOURCE_BRANCH}"
+        if [ -n "${TRIGGERING_BRANCH}" ] \
+           && [ "${TRIGGERING_BRANCH}" != "${OPERATOR_SOURCE_BRANCH}" ] \
+           && [ "${TRIGGERING_BRANCH}" != "${FALLBACK_SOURCE_BRANCH}" ]; then
+          TRIGGER_IS_DEV_BRANCH="yes"
+          DEFAULT_SOURCE_BRANCH="${TRIGGERING_BRANCH}"
+        fi
+
+        echo -n "{}"                       > "$(results.group-components.path)"
+        echo -n "false"                    > "$(results.has-group-config.path)"
+        echo -n ""                         > "$(results.invalid-repo-warnings.path)"
+        echo -n ""                         > "$(results.format-help-warning.path)"
+        echo -n "${DEFAULT_SOURCE_BRANCH}" > "$(results.source-branch.path)"
+        echo -n "false"                    > "$(results.operator-pr-included.path)"
+        echo -n "0"                        > "$(results.component-count.path)"
 
         # Decides which branch the ephemeral branch is forked from, and records
         # it.  An operator PR in the leader means the operator source itself is
@@ -154,7 +206,7 @@ spec:
         # check-leader-pr task used to cover.
         decide_fork_source() {
           local body="$1"
-          local op_repo listed count
+          local op_repo listed count operator_included
           op_repo=$(echo "${OPERATOR_REPO_NAME}" | tr 'A-Z' 'a-z')
 
           # grep -c would count matching *lines*, and a PR body is frequently
@@ -167,14 +219,33 @@ spec:
           printf '%s\n' "${listed}" >&2
           echo -n "${count}" > "$(results.component-count.path)"
 
+          # Recorded either way.  It describes the group, not the fork point,
+          # so the dev-branch path below still needs it for the snapshot.
           if printf '%s' "${listed}" | grep -qixF "${op_repo}"; then
-            echo "✓ Operator PR included - forking from main" >&2
-            echo -n "main" > "$(results.source-branch.path)"
             echo -n "true" > "$(results.operator-pr-included.path)"
+            operator_included="yes"
           else
-            echo "✓ No operator PR - forking from stable" >&2
-            echo -n "stable" > "$(results.source-branch.path)"
             echo -n "false" > "$(results.operator-pr-included.path)"
+            operator_included="no"
+          fi
+
+          # A branch that is neither of the two long-lived ones gates itself.
+          # The test was made once at the top, so the early-exit paths and this
+          # one cannot drift.  See triggering-branch's description for why this
+          # short-circuits the heuristic rather than feeding into it.
+          if [ "${TRIGGER_IS_DEV_BRANCH}" = "yes" ]; then
+            echo "✓ Triggered on '${TRIGGERING_BRANCH}', which is neither ${OPERATOR_SOURCE_BRANCH} nor ${FALLBACK_SOURCE_BRANCH}" >&2
+            echo "  Forking from it directly (operator PR in group: ${operator_included})" >&2
+            echo -n "${TRIGGERING_BRANCH}" > "$(results.source-branch.path)"
+            return
+          fi
+
+          if [ "${operator_included}" = "yes" ]; then
+            echo "✓ Operator PR included - forking from ${OPERATOR_SOURCE_BRANCH}" >&2
+            echo -n "${OPERATOR_SOURCE_BRANCH}" > "$(results.source-branch.path)"
+          else
+            echo "✓ No operator PR - forking from ${FALLBACK_SOURCE_BRANCH}" >&2
+            echo -n "${FALLBACK_SOURCE_BRANCH}" > "$(results.source-branch.path)"
           fi
         }
 
