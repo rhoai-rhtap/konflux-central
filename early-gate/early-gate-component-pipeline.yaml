@@ -113,6 +113,23 @@ spec:
     description: |
       Branch to fork from when the leader PR includes the operator repo, i.e.
       the branch that operator PR lands on.
+  - name: rhoai-version
+    type: string
+    default: ""
+    description: |
+      Which RHOAI release this gate run is for, as "3.5" or "rhoai-3.5".
+      Forwarded to operator-processor as its rhoai-version input.
+
+      Not cosmetic: operator-processor looks every component image up in Quay
+      by this tag, so it decides which images resolve at all.  Left empty, the
+      workflow falls back to guessing from the newest rhoai-X.Y branch in the
+      operator repo - a guess that silently changes meaning when a release
+      branch is created or deleted.  Deleting rhoai-3.5 from the gap fork on
+      2026-10-05 moved it to rhoai-3.0 and the processor then failed with 55 of
+      120 components "missing", with nothing in the error naming a branch.
+
+      Defaulted rather than required so the parameter can be introduced without
+      a flag day; callers should set it.
   - name: triggering-branch
     type: string
     default: ""
@@ -786,6 +803,8 @@ spec:
       value: $(tasks.fork-operator-branch.results.branch-name)
     - name: leader-pr-number
       value: $(params.leader-pr-number)
+    - name: rhoai-version
+      value: $(params.rhoai-version)
     workspaces:
     - name: github-credentials
       workspace: github-credentials
@@ -797,6 +816,9 @@ spec:
         type: string
       - name: leader-pr-number
         type: string
+      - name: rhoai-version
+        type: string
+        default: ""
       results:
       - name: previous-run-id
         description: |
@@ -827,13 +849,39 @@ spec:
           echo "Newest pre-existing workflow_dispatch run on ${BRANCH}: ${PREV_ID:-none}"
           echo -n "${PREV_ID}" > $(results.previous-run-id.path)
 
+          INPUTS="\"eg-mode\":\"true\",\"eg-branch\":\"${BRANCH}\",\"leader-pr-number\":\"$(params.leader-pr-number)\""
+
+          # rhoai-version is added only when set, which is what lets this file
+          # merge independently of the operator repo's.  GitHub rejects a
+          # dispatch carrying an input the workflow does not declare with 422,
+          # so sending it unconditionally would make this change depend on
+          # every fork's operator-processor.yaml having been updated first.
+          #
+          # It is worth passing.  Left out, the workflow picks the newest
+          # rhoai-X.Y branch in the operator repo and looks every component
+          # image up in Quay under that tag - so a branch deletion quietly
+          # changes which images the gate considers to exist.
+          RHOAI_VERSION="$(params.rhoai-version)"
+          if [ -n "${RHOAI_VERSION}" ]; then
+            INPUTS="${INPUTS},\"rhoai-version\":\"${RHOAI_VERSION}\""
+          else
+            echo "WARNING: rhoai-version is empty; operator-processor will guess the" >&2
+            echo "         release from the newest rhoai-X.Y branch in ${REPO}." >&2
+          fi
+
           DISPATCH_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
             -H "Authorization: token ${TOKEN}" \
             -X POST "https://api.github.com/repos/${REPO}/actions/workflows/operator-processor.yaml/dispatches" \
-            -d "{\"ref\":\"${BRANCH}\",\"inputs\":{\"eg-mode\":\"true\",\"eg-branch\":\"${BRANCH}\",\"leader-pr-number\":\"$(params.leader-pr-number)\"}}")
+            -d "{\"ref\":\"${BRANCH}\",\"inputs\":{${INPUTS}}}")
 
           if [ "${DISPATCH_CODE}" != "204" ]; then
             echo "workflow_dispatch was not accepted (HTTP ${DISPATCH_CODE})" >&2
+            if [ "${DISPATCH_CODE}" = "422" ]; then
+              echo "  422 is usually one of:" >&2
+              echo "    - ref '${BRANCH}' does not exist (deleted by cleanup, or never forked)" >&2
+              echo "    - operator-processor.yaml on that ref does not declare an input" >&2
+              echo "      being passed here - rhoai-version is the recent addition" >&2
+            fi
             exit 1
           fi
           echo "Dispatched operator-processor on ${BRANCH}"
