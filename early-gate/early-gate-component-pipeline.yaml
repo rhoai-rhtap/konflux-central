@@ -1771,6 +1771,156 @@ spec:
 
   finally:
 
+  # --------------------------------------------------------------------------
+  # Tell the leader PR what happened.
+  #
+  # Two invocations of one task, and the duplication is forced rather than
+  # chosen.  Tekton skips a finally task that references a result of a task
+  # which failed or never ran - that is not configurable - so a single task
+  # consuming OPERATOR_IMAGE_REF_BY_DIGEST and friends would be silent on
+  # exactly the runs someone is waiting to hear about.  The split gives the
+  # green run a comment built from results and the red run one built from
+  # $(tasks.<name>.status), which stays readable whatever happened.
+  #
+  # The guards are mutually exclusive and jointly exhaustive over the two
+  # values $(tasks.status) can take here: no task in the tasks section carries
+  # a `when`, so nothing is ever skipped and the aggregate is Succeeded or
+  # Failed and nothing else.  Adding a `when` up there means revisiting this,
+  # because "Completed" would match neither arm and the PR would hear nothing.
+  #
+  # finally tasks run in parallel - runAfter is not allowed in finally - so
+  # these race the three cleanup tasks below.  Harmless: the comment calls the
+  # ephemeral branch deleted because deletion is unconditional, not because it
+  # has been observed, and the image tags it reports do not depend on the
+  # branch still existing.
+  # --------------------------------------------------------------------------
+  - name: comment-on-leader-pr
+    params:
+    - name: leader-pr-repo
+      value: $(params.leader-pr-repo)
+    - name: leader-pr-number
+      value: $(params.leader-pr-number)
+    - name: status
+      value: "success"
+    - name: rhoai-version
+      value: $(params.rhoai-version)
+    - name: eg-branch
+      value: $(tasks.fork-operator-branch.results.branch-name)
+    - name: source-branch
+      value: $(tasks.resolve-group-configuration.results.source-branch)
+    - name: fallback-source-branch
+      value: $(params.fallback-source-branch)
+    - name: operator-pr-included
+      value: $(tasks.resolve-group-configuration.results.operator-pr-included)
+    - name: pipelinerun-name
+      value: $(context.pipelineRun.name)
+    # The three block outputs, by digest.  Same values the pipeline publishes
+    # as OPERATOR_/BUNDLE_/FBC_IMAGE_REF_BY_DIGEST; a pipeline result is not
+    # readable from a finally task, so they are taken from the tasks again.
+    - name: operator-image
+      value: $(tasks.monitor-operator-build.results.image-ref-by-digest)
+    - name: bundle-image
+      value: $(tasks.monitor-bundle-build.results.image-ref-by-digest)
+    - name: bundle-verified
+      value: $(tasks.verify-bundle-images.results.verified)
+    - name: bundle-build-url
+      value: $(tasks.monitor-bundle-build.results.build-url)
+    - name: fbc-image
+      value: $(tasks.monitor-fbc-build.results.image-ref-by-digest)
+    - name: fbc-verified
+      value: $(tasks.verify-fbc-images.results.verified)
+    - name: fbc-build-url
+      value: $(tasks.monitor-fbc-build.results.build-url)
+    - name: fbc-catalog-path
+      value: $(tasks.fbc-processor.results.catalog-path)
+    # No operator-build-url: monitor-operator-build is the inlined copy of
+    # monitor-pac-build and never grew a build-url result.  Folding the two
+    # together fixes this here as well as everywhere else it has been noted.
+    - name: has-group-config
+      value: $(tasks.resolve-group-configuration.results.has-group-config)
+    - name: component-count
+      value: $(tasks.resolve-group-configuration.results.component-count)
+    # generate-snapshot has produced component-table and fallback-warning all
+    # along; until now nothing read them.
+    - name: component-table
+      value: $(tasks.generate-snapshot.results.component-table)
+    - name: fallback-warning
+      value: $(tasks.generate-snapshot.results.fallback-warning)
+    - name: invalid-repo-warnings
+      value: $(tasks.resolve-group-configuration.results.invalid-repo-warnings)
+    - name: format-help-warning
+      value: $(tasks.resolve-group-configuration.results.format-help-warning)
+    - name: omitted-components
+      value: $(tasks.generate-snapshot.results.omitted-components)
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    when:
+    - input: $(tasks.status)
+      operator: in
+      values: ["Succeeded"]
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/post-build-complete-comment.yaml
+
+  # The red half.  Not one result referenced, on purpose: anything taken from
+  # the tasks section would skip this task on the subset of failures that
+  # happened to kill the producing task, which is the worst possible failure
+  # mode for a notification.  Everything below is a param, a context variable
+  # or a task status, all of which are always resolvable.
+  #
+  # eg-branch is recomputed from leader-pr-number rather than read from
+  # fork-operator-branch for the same reason, and the same way the three
+  # cleanup tasks below recompute theirs.
+  - name: comment-on-leader-pr-failure
+    params:
+    - name: leader-pr-repo
+      value: $(params.leader-pr-repo)
+    - name: leader-pr-number
+      value: $(params.leader-pr-number)
+    - name: status
+      value: "failure"
+    - name: rhoai-version
+      value: $(params.rhoai-version)
+    - name: eg-branch
+      value: eg-$(params.leader-pr-number)
+    - name: fallback-source-branch
+      value: $(params.fallback-source-branch)
+    - name: pipelinerun-name
+      value: $(context.pipelineRun.name)
+    - name: operator-task-status
+      value: $(tasks.monitor-operator-build.status)
+    - name: bundle-task-status
+      value: $(tasks.monitor-bundle-build.status)
+    - name: fbc-task-status
+      value: $(tasks.monitor-fbc-build.status)
+    - name: bundle-verify-status
+      value: $(tasks.verify-bundle-images.status)
+    - name: fbc-verify-status
+      value: $(tasks.verify-fbc-images.status)
+    workspaces:
+    - name: github-credentials
+      workspace: github-credentials
+    when:
+    - input: $(tasks.status)
+      operator: notin
+      values: ["Succeeded"]
+    taskRef:
+      resolver: git
+      params:
+      - name: url
+        value: https://github.com/rhoai-rhtap/konflux-central.git
+      - name: revision
+        value: $(params.konflux-central-revision)
+      - name: pathInRepo
+        value: early-gate/tasks/post-build-complete-comment.yaml
+
   # fork-operator-branch always creates a branch, so something must always
   # remove it - otherwise every run leaves an orphan behind.  Deleting it is
   # safe because the build tags the image by commit - eg-<sha> - and that tag
