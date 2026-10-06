@@ -116,6 +116,36 @@ spec:
     default: "true"
     type: string
     description: Show a slack notification on failure
+  - name: enable-slack-success-notification
+    default: "true"
+    type: string
+    description: |
+      Post the "a new build is available" message to Slack on success
+      (share-fbc-details).
+
+      Split out from enable-slack-failure-notification because the two fire on
+      opposite outcomes and only the failure one was switchable.  share-fbc-details
+      was guarded on tasks.status alone, so an early-gate build - which succeeds,
+      that being the point - announced an ephemeral eg-fbc-<uuid> branch to the
+      team channel as though it were a new CI build.
+
+      Defaults true: release builds are meant to announce themselves.
+  - name: enable-downstream-triggers
+    default: "true"
+    type: string
+    description: |
+      Dispatch the downstream GitHub workflows (conforma, smoke, disconnected
+      installer helper) when the build finishes.
+
+      Those tasks POST workflow_dispatch into red-hat-data-services repositories.
+      is_nightly already gates conforma and smoke, but it is a caller-supplied
+      default rather than a guarantee, and the disconnected-installer trigger was
+      guarded on `is_nightly in ["true","false"]` - every value the param can
+      hold, so it always ran.  An early-gate build must not reach release
+      automation at all, and that needs one switch that is true of all three
+      rather than three conditions to reason about.
+
+      Defaults true, so release behaviour is unchanged.
   - name: is_nightly
     type: string
     default: false
@@ -654,9 +684,17 @@ spec:
       values:
       - "Completed"
       - "Succeeded"
+    - input: $(params.enable-slack-success-notification)
+      operator: in
+      values:
+      - "true"
   - name: trigger-conforma
     when:
     - input: $(params.is_nightly)
+      operator: in
+      values:
+      - "true"
+    - input: $(params.enable-downstream-triggers)
       operator: in
       values:
       - "true"
@@ -698,6 +736,10 @@ spec:
       operator: in
       values:
       - "true"
+    - input: $(params.enable-downstream-triggers)
+      operator: in
+      values:
+      - "true"
     taskSpec:
       steps:
       - name: trigger-workflow
@@ -731,12 +773,22 @@ spec:
           -H "Content-Type: application/json" \
           -d '{ "ref": "main", "inputs": { "target_branch": "'"$TARGET_BRANCH"'" } }'
   - name: trigger-disconnectec-installer-helper
+    # `is_nightly in ["true","false"]` is every value the param can hold, so
+    # this guard never excluded anything - it reads like a condition and
+    # behaves like "always".  Left as it is rather than removed, because
+    # whether the disconnected helper should be nightly-only is a release
+    # question, not an early-gate one; the new guard below is what keeps the
+    # gate out of it.
     when:
     - input: $(params.is_nightly)
       operator: in
       values:
       - "true"
       - "false"
+    - input: $(params.enable-downstream-triggers)
+      operator: in
+      values:
+      - "true"
     taskSpec:
       steps:
       - name: trigger-workflow
