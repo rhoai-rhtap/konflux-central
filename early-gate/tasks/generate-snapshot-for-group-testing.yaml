@@ -22,15 +22,27 @@ spec:
     which is most of the value of group testing.  early-gate/PR-DIGESTS.md has
     the measurements and the alternatives that were rejected.
 
-    That fallback is rhoai-3.5, not rhoai-3.6, because rhoai-3.5 is what
-    operator-processor resolves against.  For an eg-* branch the processor
-    derives its release from the highest rhoai-X.Y branch in the operator
-    repo, and its ^[23]\.[0-9]+$ filter rejects rhoai-3.6-ea.1/ea.2 - the only
-    3.6 branches that exist - so it settles on rhoai-3.5.  Pinning the
-    snapshot to 3.6 would have it reference a different release from the one
-    the processor writes into operands-map.  Measured across the 72 repos in
-    the operator's operands-map, 66 carry a rhoai-3.5 tag and 58 carry a
-    rhoai-3.6 one.
+    The fallback tag must name the same release operator-processor resolves
+    against, or the snapshot references one release while the operands-map the
+    bundle is built from references another, and nothing in the chain notices.
+
+    So it is derived, not fixed.  rhoai-version is the one input that decides
+    the release for the whole run - the pipeline already forwards it to
+    operator-processor - and fallback-tag now comes from it: rhoai-${X.Y}.
+    This used to be a literal `rhoai-3.5` default that the pipeline never
+    overrode, which agreed with rhoai-version only by coincidence of two
+    independent constants.  Bumping rhoai-version to 3.6 would have left the
+    snapshot silently on 3.5.
+
+    fallback-tag is still accepted and still wins when set, for the case where
+    the two genuinely should differ.  What is not accepted is both being
+    empty: that would yield the tag `rhoai-`, which matches nothing, and every
+    component would drop out of the snapshot with no single error explaining
+    why.  That combination fails the task instead.
+
+    Measured across the 72 repos in the operator's operands-map, 66 carry a
+    rhoai-3.5 tag and 58 carry a rhoai-3.6 one, so neither release resolves
+    every component and the fallback missing some entries is normal.
 
     As with resolve-group-configuration, leader-pr-repo/leader-pr-number are
     accepted because the RHOAI early-gate pipeline is driven by the Leader PR
@@ -49,8 +61,21 @@ spec:
       default: ""
     - name: fallback-tag
       type: string
-      default: rhoai-3.5
-      description: Quay tag when PR image is missing
+      default: ""
+      description: |
+        Quay tag to use when no PR image is found.  Leave empty to derive it
+        from rhoai-version as rhoai-<X.Y>, which is what keeps it in step with
+        the release operator-processor resolves against.  Set it only to pin
+        the snapshot to a different release on purpose.
+    - name: rhoai-version
+      type: string
+      default: ""
+      description: |
+        The release this gate run is for, accepted as "3.5", "rhoai-3.5" or
+        "3.5.2" - the same three shapes the pipeline's own rhoai-version
+        takes.  Only used to derive fallback-tag, and only when fallback-tag
+        is empty.  With both empty the task fails rather than fall back to a
+        tag that matches nothing.
     - name: pr-pipelines-repo
       type: string
       default: rhoai/pull-request-pipelines
@@ -103,6 +128,8 @@ spec:
           value: $(params.COMPONENTS)
         - name: FALLBACK_TAG
           value: $(params.fallback-tag)
+        - name: RHOAI_VERSION
+          value: $(params.rhoai-version)
         - name: PR_PIPELINES_REPO
           value: $(params.pr-pipelines-repo)
         - name: WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND
@@ -125,6 +152,41 @@ spec:
         #!/bin/bash
         set -e
         cat /etc/*release
+
+        # --- Resolve the fallback tag -------------------------------------
+        # An explicit fallback-tag wins.  Otherwise derive it from
+        # rhoai-version so the snapshot and operator-processor name the same
+        # release; see the task description for why they must agree.
+        #
+        # Three input shapes are accepted because rhoai-version carries all
+        # three in practice: "3.5" from the gate's own parameter, "rhoai-3.5"
+        # as the pipeline's description permits, and "3.5.2" from the release
+        # push files.  Strip the prefix, keep major.minor, and require that
+        # what is left actually looks like a release - an unrecognised value
+        # must fail here rather than become a tag that matches nothing.
+        if [[ -z "${FALLBACK_TAG}" ]]; then
+          if [[ -z "${RHOAI_VERSION}" ]]; then
+            echo "ERROR: neither fallback-tag nor rhoai-version was supplied." >&2
+            echo "       One of them has to name the release whose images this" >&2
+            echo "       snapshot falls back to.  Deriving 'rhoai-' from an empty" >&2
+            echo "       version would match no tag in any repository and drop" >&2
+            echo "       every component from the snapshot without saying why." >&2
+            exit 1
+          fi
+          MAJOR_MINOR="${RHOAI_VERSION#rhoai-}"
+          MAJOR_MINOR=$(printf '%s' "${MAJOR_MINOR}" | cut -d. -f1,2)
+          if [[ ! "${MAJOR_MINOR}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: cannot derive a fallback tag from rhoai-version='${RHOAI_VERSION}'." >&2
+            echo "       Expected 3.5, rhoai-3.5 or 3.5.2; got major.minor='${MAJOR_MINOR}'." >&2
+            echo "       Pass fallback-tag explicitly if this release does not fit" >&2
+            echo "       the rhoai-<major>.<minor> tag convention." >&2
+            exit 1
+          fi
+          FALLBACK_TAG="rhoai-${MAJOR_MINOR}"
+          echo "Derived fallback tag ${FALLBACK_TAG} from rhoai-version='${RHOAI_VERSION}'" >&2
+        else
+          echo "Using the explicitly supplied fallback tag ${FALLBACK_TAG}" >&2
+        fi
 
         # The basic-auth workspace carries the RHOAI Quay read-only robot
         # credential; quay.io/rhoai is private.  It stays optional, so a group

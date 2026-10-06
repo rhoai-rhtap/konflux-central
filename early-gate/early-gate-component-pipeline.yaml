@@ -134,6 +134,23 @@ spec:
 
       Defaulted rather than required so the parameter can be introduced without
       a flag day; callers should set it.
+  - name: fallback-tag
+    type: string
+    default: ""
+    description: |
+      Quay tag generate-snapshot uses for a component with no PR build.
+
+      Empty is the normal setting: the task then derives rhoai-<X.Y> from
+      rhoai-version, which is what keeps the snapshot on the same release
+      operator-processor resolves against.  Set this only to pin the group
+      components to a different release from the operator on purpose.
+
+      It is a parameter rather than a literal because the two used to drift.
+      fallback-tag was hardcoded rhoai-3.5 inside the task and never
+      overridden here, so it agreed with rhoai-version by coincidence of two
+      independent constants: bumping rhoai-version to 3.6 would have left the
+      group testing 3.5 images while the bundle pinned 3.6 ones - green, and
+      wrong, with nothing in the comment showing the mismatch.
   - name: triggering-branch
     type: string
     default: ""
@@ -583,6 +600,16 @@ spec:
       value: $(params.leader-pr-repo)
     - name: leader-pr-number
       value: $(params.leader-pr-number)
+    # Both, not either: the task takes fallback-tag when it is set and derives
+    # rhoai-<X.Y> from rhoai-version when it is not.  Tekton treats an
+    # explicitly passed empty string as an override, so the task cannot carry
+    # a useful default of its own - the derivation has to happen inside it,
+    # which is why rhoai-version is passed down rather than interpolated into
+    # a tag here.
+    - name: fallback-tag
+      value: $(params.fallback-tag)
+    - name: rhoai-version
+      value: $(params.rhoai-version)
     - name: ociStorage
     # Upstream writes $(params.operator-output-image).snapshot, which works
     # there because its operator-output-image carries a tag
