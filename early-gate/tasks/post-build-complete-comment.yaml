@@ -428,14 +428,38 @@ spec:
         done <<< "${COMPONENT_TABLE}"
 
         # The other fallback: component images, not the operator branch.
+        #
+        # Collapsed, and not quoted with a leading "> ".  Both follow from run
+        # 18, where all fourteen components fell back: `echo "> ${VAR}"`
+        # prefixes only the FIRST line of a multi-line value, so thirteen
+        # entries rendered outside the blockquote, and the list restated what
+        # the Status column of the table above had already said on every row.
+        #
+        # The count is worth having in the summary line even collapsed.  This
+        # is the condition under which the gate certifies released component
+        # images rather than the proposed ones - green, but not testing what
+        # the leader PR asked it to test - so it should be legible without
+        # expanding anything.
         if [ -n "$(trimmed "${FALLBACK_WARNING}")" ]; then
+          FALLBACK_COUNT=$(printf '%s\n' "${FALLBACK_WARNING}" | grep -c '^- Component' || true)
+          COMPONENT_ROWS=$(printf '%s\n' "${COMPONENT_TABLE}" | grep -c '[^[:space:]]' || true)
+          if [ "${FALLBACK_COUNT}" = "0" ]; then
+            FALLBACK_LABEL="Some components"
+          else
+            FALLBACK_LABEL="${FALLBACK_COUNT} of ${COMPONENT_ROWS} components"
+          fi
           {
             echo
-            echo ":warning: Some components fell back to their stable image because"
-            echo "their PR build had not finished.  Re-run the gate once those builds"
-            echo "are green."
+            echo "<details><summary>:warning: ${FALLBACK_LABEL} fell back to a released image — the gate did not test their PR code</summary>"
             echo
-            echo "> ${FALLBACK_WARNING}"
+            printf '%s\n' "${FALLBACK_WARNING}"
+            echo
+            echo "A component falls back when no PR build exists for its head commit:"
+            echo "the build is still running, or that component has no PR pipeline on"
+            echo "the branch the PR targets.  Re-run the gate once those builds are"
+            echo "green; if a component never produces one, its PR pipeline is the"
+            echo "thing to fix."
+            echo "</details>"
           } >> "${BODY}"
         fi
 
