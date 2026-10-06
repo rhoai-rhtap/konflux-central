@@ -1089,6 +1089,16 @@ spec:
         type: string
       - name: output-image
         type: string
+      # Declared, which it was not before.  The call site has passed image-tag
+      # since all three blocks moved to one repository, but this inlined
+      # taskSpec never declared it and the script below reconstructed
+      # "eg-<sha>" instead - and an undeclared param on an embedded taskSpec is
+      # dropped, not rejected, so the value went nowhere with nothing said.
+      # monitor-pac-build got this right; only this copy was missed, which is
+      # the duplication the folding note on BUNDLE_BUILD_URL is about.
+      - name: image-tag
+        type: string
+        default: ""
       - name: timeout-minutes
         type: string
       results:
@@ -1121,9 +1131,30 @@ spec:
           CHECK="$(params.check-name)"
           TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
 
-          # Tag the same way rhods-operator-gap-eg-push.yaml does, so the
-          # reference reported here is the one that was actually pushed.
-          IMAGE_REF="$(params.output-image):eg-${SHA}"
+          # No "eg-${SHA}" reconstruction any more.  That form was right while
+          # each block owned a repository and the tag only had to identify the
+          # commit; since all three share quay.io/rhoai/pull-request-pipelines
+          # the component prefix is what tells them apart, and this task has no
+          # way to derive it - nothing it is given says which component it is
+          # watching.
+          #
+          # Reconstructing it was not a harmless default, it named a tag no
+          # build pushes: Block 1 pushed rhods-operator-eg-5-<sha> while this
+          # polled for eg-<sha>, got six 404s, warned, and wrote an empty
+          # digest.  The task then went green and update-group-snapshot failed
+          # 15 seconds later on "No operator image supplied", pointing at the
+          # consumer rather than at the tag.  Empty is an error for that
+          # reason, matching monitor-pac-build.
+          TAG="$(params.image-tag)"
+          if [ -z "${TAG}" ]; then
+            echo "ERROR: image-tag is empty." >&2
+            echo "  Pass the full tag the build applies, component prefix included," >&2
+            echo "  e.g. rhods-operator-eg-<leader-pr>-<sha>.  It must match" >&2
+            echo "  output-image in .tekton/rhods-operator-gap-eg-push.yaml." >&2
+            exit 1
+          fi
+
+          IMAGE_REF="$(params.output-image):${TAG}"
           echo -n "${IMAGE_REF}" > $(results.image-ref.path)
 
           # Written before anything can fail.  A declared result that never
@@ -1229,7 +1260,7 @@ spec:
                     break
                   fi
                   DIGEST=""
-                  echo "Tag eg-${SHA} not readable yet, retry ${attempt}/6..."
+                  echo "Tag ${TAG} not readable yet, retry ${attempt}/6..."
                   sleep 10
                 done
 
