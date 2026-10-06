@@ -23,7 +23,7 @@ spec:
                              component set AND decide main vs stable
       generate-snapshot      pin each of those components to a quay digest
       audit-snapshot         log the snapshot, flag whether it has the operator
-      fork-operator-branch   always create eg-<leader-pr-number>
+      fork-operator-branch   always create eg-<leader-pr>-<pipelinerun-uid>
       trigger-operator-...   dispatch operator-processor, return the run id
       monitor-operator-...   wait for it, read back the commit it pushed
       monitor-operator-build wait for the PaC build, resolve the image digest
@@ -81,7 +81,10 @@ spec:
     description: org/repo of the promoter repository holding the leader PR
   - name: leader-pr-number
     type: string
-    description: Leader PR number; the ephemeral branch is named eg-<this>
+    description: |
+      Leader PR number.  The ephemeral branch is eg-<this>-<pipelinerun-uid>;
+      the uid is what keeps two runs on one leader PR from sharing a branch
+      and a set of trusted-artifact tags.
   - name: operator-repo
     type: string
     default: "rhoai-rhtap/rhods-operator-gap"
@@ -591,7 +594,16 @@ spec:
     #
     # This was invisible until now: enable-group-snapshot defaulted to
     # "false", so this task had never actually run.
-      value: $(params.operator-output-image):eg-$(params.leader-pr-number).snapshot
+    #
+    # The pipelineRun uid is in the tag for the same reason it is in the
+    # ephemeral branch name, and it matters more here.  A trusted-artifact tag
+    # is mutable: two runs on one leader PR sharing eg-<pr>.snapshot do not
+    # collide loudly, they overwrite, and the loser reads the winner's
+    # snapshot and builds a bundle from it.  Nothing in the chain would
+    # notice - the digests resolve, verify-bundle-images passes, and the gate
+    # goes green on an artifact assembled from two different runs.  Same
+    # applies to the .bundle and .fbc tags below.
+      value: $(params.operator-output-image):eg-$(params.leader-pr-number)-$(context.pipelineRun.uid).snapshot
     - name: ociArtifactExpiresAfter
       value: $(params.image-expires-after)
     workspaces:
@@ -720,8 +732,35 @@ spec:
       value: $(params.operator-repo)
     - name: source-branch
       value: $(tasks.resolve-group-configuration.results.source-branch)
+    # eg-<leader-pr>-<pipelinerun-uid>, not the bare eg-<leader-pr> this used
+    # to be.  The bare form is a FIXED name, and two gate runs on one leader PR
+    # is not a hypothetical - pushing twice to a PR in quick succession is the
+    # ordinary way to get there.
+    #
+    # What made it worse than a clash: the step below answers a 422 by force-
+    # resetting the branch to the source head.  So run B did not fail, it
+    # silently discarded the snapshot commit run A's build was waiting on, and
+    # then whichever run finished first deleted the branch out from under the
+    # other in finally.  A fixed name turns a concurrency bug into a
+    # wrong-artifact bug, which is the kind a gate exists to prevent.
+    #
+    # $(context.pipelineRun.uid) rather than anything derived from a task
+    # result, for the reason the cleanup tasks give at length: it resolves in
+    # finally regardless of what failed, so the name can be recomputed by the
+    # task that deletes the branch and by the task that reports it.  Blocks 2
+    # and 3 have keyed their branches off the uid from the start; this is
+    # Block 1 catching up.
+    #
+    # The force-reset path stays, and is no longer dead: Tekton retries a
+    # TaskRun with the same pipelineRun uid, so a retried fork legitimately
+    # meets its own branch.
+    #
+    # Tag length is fine.  The operator image is tagged
+    # rhods-operator-{{target_branch}}-{{revision}}, so this takes the worst
+    # case from 60 to 97 characters, 101 with the .git suffix.  No platform
+    # suffix applies - build-image-index is false on the operator build.
     - name: branch-name
-      value: eg-$(params.leader-pr-number)
+      value: eg-$(params.leader-pr-number)-$(context.pipelineRun.uid)
     workspaces:
     - name: github-credentials
       workspace: github-credentials
@@ -1361,7 +1400,7 @@ spec:
     # The .bundle tag suffix is kept so Block 2's artifacts stay distinct from
     # Block 1's .snapshot ones inside the shared repository.
     - name: ociStorage
-      value: $(params.operator-output-image):eg-$(params.leader-pr-number).bundle
+      value: $(params.operator-output-image):eg-$(params.leader-pr-number)-$(context.pipelineRun.uid).bundle
     - name: ociArtifactExpiresAfter
       value: $(params.image-expires-after)
     taskRef:
@@ -1429,7 +1468,7 @@ spec:
     - name: SNAPSHOT_OPERATOR_KEY
       value: $(params.snapshot-operator-key)
     - name: ociStorage
-      value: $(params.operator-output-image):eg-$(params.leader-pr-number).bundle
+      value: $(params.operator-output-image):eg-$(params.leader-pr-number)-$(context.pipelineRun.uid).bundle
     - name: ociArtifactExpiresAfter
       value: $(params.image-expires-after)
     taskRef:
@@ -1463,7 +1502,7 @@ spec:
     - name: USE_EXISTING_DIGESTS
       value: "true"
     - name: ociStorage
-      value: $(params.operator-output-image):eg-$(params.leader-pr-number).bundle
+      value: $(params.operator-output-image):eg-$(params.leader-pr-number)-$(context.pipelineRun.uid).bundle
     - name: ociArtifactExpiresAfter
       value: $(params.image-expires-after)
     taskRef:
@@ -1643,7 +1682,7 @@ spec:
     # build-pipeline-rhods-operator-gap, whose registry credential covers that
     # Component's repository and no other.
     - name: ociStorage
-      value: $(params.operator-output-image):eg-$(params.leader-pr-number).fbc
+      value: $(params.operator-output-image):eg-$(params.leader-pr-number)-$(context.pipelineRun.uid).fbc
     - name: ociArtifactExpiresAfter
       value: $(params.image-expires-after)
     taskRef:
@@ -1889,7 +1928,7 @@ spec:
     - name: rhoai-version
       value: $(params.rhoai-version)
     - name: eg-branch
-      value: eg-$(params.leader-pr-number)
+      value: eg-$(params.leader-pr-number)-$(context.pipelineRun.uid)
     - name: fallback-source-branch
       value: $(params.fallback-source-branch)
     - name: pipelinerun-name
@@ -1923,16 +1962,24 @@ spec:
 
   # fork-operator-branch always creates a branch, so something must always
   # remove it - otherwise every run leaves an orphan behind.  Deleting it is
-  # safe because the build tags the image by commit - eg-<sha> - and that tag
-  # does not depend on the ref still existing.  rhods-operator-gap-eg-push.yaml
-  # also pushes eg-<leader-pr-number>-<sha> via additional-tags; both resolve to
-  # the same digest, and monitor-operator-build reads back the eg-<sha> one.
+  # safe because the image tag is a string the build already applied, not a
+  # reference to the ref: rhods-operator-gap-eg-push.yaml pushes a single
+  # rhods-operator-{{target_branch}}-{{revision}} tag, and it keeps resolving
+  # long after the branch is gone.  (That tag is also why the branch name has
+  # to be stable across the run, not regenerated.)
+  #
+  # Recomputed rather than read from fork-operator-branch's result, because a
+  # finally task that references a failed task's result is skipped entirely,
+  # which is exactly when cleanup matters most.  That constraint is what
+  # forces the uid rather than, say, a random suffix generated in the fork
+  # step: $(context.pipelineRun.uid) is the one unique-per-run value both ends
+  # can derive independently.
   - name: cleanup-ephemeral-branch
     params:
     - name: repo
       value: $(params.operator-repo)
     - name: branch-name
-      value: eg-$(params.leader-pr-number)
+      value: eg-$(params.leader-pr-number)-$(context.pipelineRun.uid)
     workspaces:
     - name: github-credentials
       workspace: github-credentials
@@ -1956,7 +2003,8 @@ spec:
           BRANCH="$(params.branch-name)"
           TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
 
-          # The branch name is recomputed from the leader PR number rather than
+          # The branch name is recomputed from the leader PR number and the
+          # pipelineRun uid rather than
           # consumed from fork-operator-branch's result: a finally task that
           # references a failed task's result is skipped entirely, which is
           # exactly when cleanup matters most.
