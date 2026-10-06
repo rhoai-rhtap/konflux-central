@@ -14,8 +14,9 @@ spec:
 
       Block 1  operator  -> rhods-operator-gap-eg-push.yaml, in the operator
                             repo's .tekton/
-      Block 2  bundle    -> odh-operator-bundle-v3-6-eg-push.yaml, in
-                            RHOAI-Build-Config's .tekton/
+      Block 2  bundle    -> rhod-operator-bundle-gap-push.yaml, in
+                            RHOAI-Build-Config-gap's .tekton/
+      Block 3  fbc       -> rhoai-fbc-fragment-gap-push.yaml, likewise
 
     Block 1's sequence is:
 
