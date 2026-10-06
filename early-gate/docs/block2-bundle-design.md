@@ -81,7 +81,7 @@ Every DR, where it is addressed, and what actually happens.
 | a | Identify latest Y-stream release branch | `clone-build-config-repo.yaml`, `resolve-and-clone` step | ✅ |
 | b | Fork ephemeral branch `eg-bundle-<run-id>` | pipeline task `fork-bundle-branch` → `create-ephemeral-branch.yaml` | ✅ |
 | c | Run ALL processing on it, never the release branch | `update-group-snapshot`, `bundle-processor`, `verify-bundle-images` all run after the fork; the only git write is the push | ✅ |
-| d | Push processed files → PaC triggers the build | `push-bundle-to-ephemeral-branch.yaml` + `odh-operator-bundle-v3-6-eg-push.yaml` CEL | ✅ |
+| d | Push processed files → PaC triggers the build | `push-bundle-to-ephemeral-branch.yaml` + `rhod-operator-bundle-gap-push.yaml` CEL | ✅ |
 | e | Delete the branch after success | `finally: cleanup-bundle-ephemeral-branch` | ✅ |
 | f | Defer cleanup if Block 3 needs it; document the dependency | `defer-cleanup` param; pipeline param `defer-bundle-branch-cleanup`; §4 below | ✅ |
 
@@ -362,7 +362,9 @@ exercise what the release exercises:
   `cleanup-ephemeral-branch.yaml` — upstream never creates a branch or pushes
 - `verify-bundle-images.yaml` — DR-6 has no upstream counterpart at all
 - `monitor-pac-build.yaml` — a consequence of the inversion
-- `pipelineruns/RHOAI-Build-Config/.tekton/odh-operator-bundle-v3-6-eg-push.yaml`
+- the bundle's early-gate push PipelineRun. During the POC this lives in the fork,
+  as `RHOAI-Build-Config-gap/.tekton/rhod-operator-bundle-gap-push.yaml`; see the
+  prerequisite below for what the prod rollout needs.
 
 ---
 
@@ -376,15 +378,28 @@ exercise what the release exercises:
    `quay.io/redhat-user-workloads/rhoai-tenant/odh-operator-bundle-gap`. Mirrors
    Block 1's `rhods-operator-gap`. **Not yet created.**
 
-2. **`odh-operator-bundle-v3-6-eg-push.yaml` must be on `rhoai-3.6` in
+2. **A bundle early-gate push PipelineRun must be on the release branch in
    RHOAI-Build-Config.** PaC reads `.tekton/` from the branch the push landed on, and
-   `eg-bundle-*` is forked from `rhoai-3.6` — so the file has to be there to be
-   inherited. It is authored here under `pipelineruns/RHOAI-Build-Config/.tekton/`,
-   which is the sync source; landing it means cherry-picking to konflux-central's
-   `rhoai-3.6` branch, since the sync is branch-to-branch.
+   `eg-bundle-*` is forked from that release branch — so the file has to be there to be
+   inherited. The sync source would be `pipelineruns/RHOAI-Build-Config/.tekton/`, and
+   landing it means cherry-picking to the matching konflux-central branch, since the
+   sync is branch-to-branch. Note that `RHOAI-Build-Config` is **not** currently in
+   `sync-pipelineruns.yml`'s repository list, so that entry has to be added too.
 
-   It is inert on `rhoai-3.6` itself: its CEL requires
+   It is inert on the release branch itself: its CEL requires
    `target_branch.startsWith("eg-bundle-")`.
+
+   **Write this fresh from the fork's copy — do not revive the old template.** A
+   draft once existed here as `odh-operator-bundle-v3-6-eg-push.yaml` and was deleted
+   because it had gone stale in three ways that each break the gate: it pushed to
+   `quay.io/redhat-user-workloads/rhoai-tenant/odh-operator-bundle-gap` rather than the
+   shared `quay.io/rhoai/pull-request-pipelines`; it tagged `eg-{{revision}}` with no
+   component prefix, which in a shared repository cannot say which block produced the
+   image; and it had no `{{target_branch}}` segment, so two gate runs would overwrite
+   one another. `RHOAI-Build-Config-gap/.tekton/rhod-operator-bundle-gap-push.yaml` is
+   the current, correct shape; the rollout is that file with the gap names swapped for
+   prod's. Its `output-image` must stay character-for-character in step with
+   `image-tag` on `monitor-bundle-build`.
 
    *Alternative if adding a file to `rhoai-3.6` is not acceptable for the smoke test:*
    have the push task write `.tekton/` onto the ephemeral branch too (add `.tekton` to
@@ -408,7 +423,9 @@ exercise what the release exercises:
 - **Filename.** The brief asks for
   `pipelineruns/RHOAI-Build-Config/.tekton/odh-operator-bundle-v3-6-push.yaml`. That is
   the *existing release* PipelineRun's name — using it would overwrite the release
-  build on the next sync. Written as `odh-operator-bundle-v3-6-**eg**-push.yaml`.
+  build on the next sync, so the gate's file must carry a distinct name. The POC uses
+  `rhod-operator-bundle-gap-push.yaml` in the fork; whatever the prod rollout is
+  called, it must not be the release file's name.
 
 - **`build-source-image: true`** is kept, matching the release file, even though a
   throwaway gate build does not need a source container. The gate is more useful if it

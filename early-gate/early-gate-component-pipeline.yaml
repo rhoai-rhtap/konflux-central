@@ -14,8 +14,9 @@ spec:
 
       Block 1  operator  -> rhods-operator-gap-eg-push.yaml, in the operator
                             repo's .tekton/
-      Block 2  bundle    -> odh-operator-bundle-v3-6-eg-push.yaml, in
-                            RHOAI-Build-Config's .tekton/
+      Block 2  bundle    -> rhod-operator-bundle-gap-push.yaml, in
+                            RHOAI-Build-Config-gap's .tekton/
+      Block 3  fbc       -> rhoai-fbc-fragment-gap-push.yaml, likewise
 
     Block 1's sequence is:
 
@@ -756,8 +757,8 @@ spec:
     # meets its own branch.
     #
     # Tag length is fine.  The operator image is tagged
-    # rhods-operator-{{target_branch}}-{{revision}}, so this takes the worst
-    # case from 60 to 97 characters, 101 with the .git suffix.  No platform
+    # odh-operator-{{target_branch}}-{{revision}}, so this takes the worst
+    # case from 57 to 94 characters, 98 with the .git suffix.  No platform
     # suffix applies - build-image-index is false on the operator build.
     - name: branch-name
       value: eg-$(params.leader-pr-number)-$(context.pipelineRun.uid)
@@ -1111,8 +1112,17 @@ spec:
     # This must stay character-for-character equal to output-image in the
     # operator repo's .tekton/rhods-operator-gap-eg-push.yaml, which resolves
     # '{{target_branch}}-{{revision}}' against the same branch and commit.
+    #
+    # odh-operator, not rhods-operator.  The prefix names the Konflux
+    # component that produces the image, and prod's operator component is
+    # odh-operator - pipelineruns/rhods-operator/.tekton/
+    # odh-operator-pull-request.yaml publishes
+    # pull-request-pipelines:odh-operator-{{revision}}.  rhods-operator was
+    # the repository's name, not the component's, and it left Block 1 as the
+    # only one of the three not matching prod: Block 2 already uses
+    # odh-operator-bundle and Block 3 rhoai-fbc-fragment.
     - name: image-tag
-      value: rhods-operator-$(tasks.fork-operator-branch.results.branch-name)-$(tasks.monitor-operator-processor.results.processor-commit)
+      value: odh-operator-$(tasks.fork-operator-branch.results.branch-name)-$(tasks.monitor-operator-processor.results.processor-commit)
     - name: timeout-minutes
       value: $(params.build-timeout-minutes)
     workspaces:
@@ -1178,7 +1188,7 @@ spec:
           # watching.
           #
           # Reconstructing it was not a harmless default, it named a tag no
-          # build pushes: Block 1 pushed rhods-operator-eg-5-<sha> while this
+          # build pushes: Block 1 pushed odh-operator-eg-5-<sha> while this
           # polled for eg-<sha>, got six 404s, warned, and wrote an empty
           # digest.  The task then went green and update-group-snapshot failed
           # 15 seconds later on "No operator image supplied", pointing at the
@@ -1188,7 +1198,7 @@ spec:
           if [ -z "${TAG}" ]; then
             echo "ERROR: image-tag is empty." >&2
             echo "  Pass the full tag the build applies, component prefix included," >&2
-            echo "  e.g. rhods-operator-eg-<leader-pr>-<sha>.  It must match" >&2
+            echo "  e.g. odh-operator-eg-<leader-pr>-<uid>-<sha>.  It must match" >&2
             echo "  output-image in .tekton/rhods-operator-gap-eg-push.yaml." >&2
             exit 1
           fi
@@ -1856,16 +1866,32 @@ spec:
     # The three block outputs, by digest.  Same values the pipeline publishes
     # as OPERATOR_/BUNDLE_/FBC_IMAGE_REF_BY_DIGEST; a pipeline result is not
     # readable from a finally task, so they are taken from the tasks again.
+    #
+    # The tagged ref goes alongside each one.  All three blocks push to the
+    # same repository - quay.io/rhoai/pull-request-pipelines - and what
+    # separates them is the component prefix on the tag:
+    # odh-operator-..., odh-operator-bundle-..., rhoai-fbc-fragment-....
+    # A digest ref drops the tag, so a comment built from the by-digest
+    # results alone printed the same repository name in all three rows, as
+    # though the blocks were overwriting one another.  They were not - run
+    # 18's three tags were distinct in Quay - but nothing in the comment
+    # showed it.
     - name: operator-image
       value: $(tasks.monitor-operator-build.results.image-ref-by-digest)
+    - name: operator-image-ref
+      value: $(tasks.monitor-operator-build.results.image-ref)
     - name: bundle-image
       value: $(tasks.monitor-bundle-build.results.image-ref-by-digest)
+    - name: bundle-image-ref
+      value: $(tasks.monitor-bundle-build.results.image-ref)
     - name: bundle-verified
       value: $(tasks.verify-bundle-images.results.verified)
     - name: bundle-build-url
       value: $(tasks.monitor-bundle-build.results.build-url)
     - name: fbc-image
       value: $(tasks.monitor-fbc-build.results.image-ref-by-digest)
+    - name: fbc-image-ref
+      value: $(tasks.monitor-fbc-build.results.image-ref)
     - name: fbc-verified
       value: $(tasks.verify-fbc-images.results.verified)
     - name: fbc-build-url
@@ -1964,7 +1990,7 @@ spec:
   # remove it - otherwise every run leaves an orphan behind.  Deleting it is
   # safe because the image tag is a string the build already applied, not a
   # reference to the ref: rhods-operator-gap-eg-push.yaml pushes a single
-  # rhods-operator-{{target_branch}}-{{revision}} tag, and it keeps resolving
+  # odh-operator-{{target_branch}}-{{revision}} tag, and it keeps resolving
   # long after the branch is gone.  (That tag is also why the branch name has
   # to be stable across the run, not regenerated.)
   #

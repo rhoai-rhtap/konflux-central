@@ -89,14 +89,31 @@ spec:
     default: ""
 
   # --- Block outputs ---
+  # Both the digest ref and the tagged ref, for each block, and the second
+  # is not redundant.  All three blocks publish to one shared repository -
+  # quay.io/rhoai/pull-request-pipelines, which is RHOAI's convention for
+  # non-release artifacts - and what distinguishes them is the leading
+  # segment of the TAG: rhods-operator-..., odh-operator-bundle-...,
+  # rhoai-fbc-fragment-....  A digest ref carries no tag, so a table built
+  # from the *-image params alone prints the same repository name three
+  # times and the reader cannot tell the operator from the fragment.  That
+  # is what run 18's comment looked like.
   - name: operator-image
     type: string
     default: ""
     description: OPERATOR_IMAGE_REF_BY_DIGEST
+  - name: operator-image-ref
+    type: string
+    default: ""
+    description: The tagged ref for Block 1, monitor's image-ref result
   - name: bundle-image
     type: string
     default: ""
     description: BUNDLE_IMAGE_REF_BY_DIGEST
+  - name: bundle-image-ref
+    type: string
+    default: ""
+    description: The tagged ref for Block 2
   - name: bundle-verified
     type: string
     default: ""
@@ -107,6 +124,10 @@ spec:
     type: string
     default: ""
     description: FBC_IMAGE_REF_BY_DIGEST - what a smoke test installs from
+  - name: fbc-image-ref
+    type: string
+    default: ""
+    description: The tagged ref for Block 3
   - name: fbc-verified
     type: string
     default: ""
@@ -204,14 +225,20 @@ spec:
       value: $(params.pipelinerun-name)
     - name: OPERATOR_IMAGE
       value: $(params.operator-image)
+    - name: OPERATOR_IMAGE_REF
+      value: $(params.operator-image-ref)
     - name: BUNDLE_IMAGE
       value: $(params.bundle-image)
+    - name: BUNDLE_IMAGE_REF
+      value: $(params.bundle-image-ref)
     - name: BUNDLE_VERIFIED
       value: $(params.bundle-verified)
     - name: BUNDLE_BUILD_URL
       value: $(params.bundle-build-url)
     - name: FBC_IMAGE
       value: $(params.fbc-image)
+    - name: FBC_IMAGE_REF
+      value: $(params.fbc-image-ref)
     - name: FBC_VERIFIED
       value: $(params.fbc-verified)
     - name: FBC_BUILD_URL
@@ -323,16 +350,62 @@ spec:
         esac
       }
 
+      # Split a ref into its parts.  The colon that introduces a tag is the
+      # one after the last slash - a registry may carry a :port - and a
+      # digest ref has an @ instead.
+      ref_repo() {
+        case "${1##*/}" in
+          *@*) printf '%s' "${1%@*}" ;;
+          *:*) printf '%s' "${1%:*}" ;;
+          *)   printf '%s' "$1" ;;
+        esac
+      }
+      ref_tag() {
+        case "${1##*/}" in
+          *:*) printf '%s' "${1##*:}" ;;
+          *)   printf '' ;;
+        esac
+      }
+      ref_digest() {
+        case "$1" in
+          *@*) printf '%s' "${1##*@}" ;;
+          *)   printf '' ;;
+        esac
+      }
+
       if [ -n "${OPERATOR_IMAGE}${BUNDLE_IMAGE}${FBC_IMAGE}" ]; then
+        # The repository is stated once, above the table, rather than
+        # repeated in all three rows.  It is the same string every time -
+        # one shared repo is the RHOAI convention for non-release builds,
+        # and being a different repo from the release ones is what makes a
+        # collision with a release digest impossible - so repeating it
+        # three times crowds out the part that actually differs.
+        ARTIFACT_REPO=$(ref_repo "${OPERATOR_IMAGE:-${BUNDLE_IMAGE:-${FBC_IMAGE}}}")
+
         {
           echo
           echo "**Artifacts**"
           echo
-          echo "| Block | Image (by digest) | Verified |"
-          echo "|-------|-------------------|----------|"
-          echo "| 1 · Operator | \`$(cell "${OPERATOR_IMAGE:---}")\` | — |"
-          echo "| 2 · Bundle | \`$(cell "${BUNDLE_IMAGE:---}")\` | $(verdict "${BUNDLE_VERIFIED}") |"
-          echo "| 3 · FBC | \`$(cell "${FBC_IMAGE:---}")\` | $(verdict "${FBC_VERIFIED}") |"
+          if [ -n "${ARTIFACT_REPO}" ]; then
+            # Backticks unescaped: this is a single-quoted printf format, so a
+            # backslash would reach the comment verbatim as \`.
+            printf 'All three in `%s`, told apart by the component prefix on the tag.\n\n' "$(cell "${ARTIFACT_REPO}")"
+          fi
+          echo "| Block | Tag | Digest | Verified |"
+          echo "|-------|-----|--------|----------|"
+          echo "| 1 · Operator | \`$(cell "$(ref_tag "${OPERATOR_IMAGE_REF}")")\` | \`$(cell "$(ref_digest "${OPERATOR_IMAGE}")")\` | — |"
+          echo "| 2 · Bundle | \`$(cell "$(ref_tag "${BUNDLE_IMAGE_REF}")")\` | \`$(cell "$(ref_digest "${BUNDLE_IMAGE}")")\` | $(verdict "${BUNDLE_VERIFIED}") |"
+          echo "| 3 · FBC | \`$(cell "$(ref_tag "${FBC_IMAGE_REF}")")\` | \`$(cell "$(ref_digest "${FBC_IMAGE}")")\` | $(verdict "${FBC_VERIFIED}") |"
+          echo
+          echo "<details><summary>Full pull refs</summary>"
+          echo
+          echo '```'
+          [ -n "${OPERATOR_IMAGE}" ] && echo "${OPERATOR_IMAGE}"
+          [ -n "${BUNDLE_IMAGE}" ]   && echo "${BUNDLE_IMAGE}"
+          [ -n "${FBC_IMAGE}" ]      && echo "${FBC_IMAGE}"
+          echo '```'
+          echo
+          echo "</details>"
         } >> "${BODY}"
 
         if [ -n "${FBC_IMAGE}" ]; then
