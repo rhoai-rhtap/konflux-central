@@ -133,9 +133,15 @@ spec:
       # Tags that mean "this came from the release, not from the gate".  The
       # branch we forked from is included by name, so a gate against rhoai-3.7
       # rejects rhoai-3.7 even if the generic pattern is ever loosened.
+      #
+      # odh-pr/odh-pr-<N> is the odd one out: it is not a release tag, it is
+      # upstream ODH's per-PR tag.  Rejected all the same, because the thing
+      # being verified is that every operand the gate ships came from this
+      # gate run, and an ODH PR image is no more that than a released one is.
       FORBIDDEN_TAGS = {t for t in (RELEASE_BRANCH, "odh-stable", "latest", "stable") if t}
       FORBIDDEN_TAG_RE = re.compile(
-          r"^(?:rhoai-\d+\.\d+(?:[.-].*)?|odh-stable|latest|stable|.*-nightly)$"
+          r"^(?:rhoai-\d+\.\d+(?:[.-].*)?|odh-stable|odh-pr(?:-.*)?"
+          r"|latest|stable|.*-nightly)$"
       )
 
 
