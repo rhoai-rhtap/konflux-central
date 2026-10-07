@@ -3,98 +3,30 @@ kind: Task
 metadata:
   name: generate-snapshot-for-group-testing
 spec:
-  description: |
-    RHOAI adaptation of opendatahub-io/odh-konflux-central's
-    early-gate/tasks/generate-snapshot-for-group-testing.yaml.
-
-    What differs from upstream is the component map it falls back to
-    (rhoai-rhtap/konflux-central), where it looks for a component's PR image,
-    and the tag it falls back to when that image has not been published yet.
-
-    Where it looks is the substantive change.  Upstream assumes a component PR
-    build lands in the component's own repository under a tag naming the PR
-    (odh-pr-<N>), which is true of ODH and false of RHOAI: every RHOAI
-    component PR pipeline publishes to the one shared repository
-    quay.io/rhoai/pull-request-pipelines, tagged <component>-<commit>.  Without
-    a probe for that layout the PR tag never resolved and every component in
-    every group silently used its released image instead of the proposed one,
-    which is most of the value of group testing.  early-gate/PR-DIGESTS.md has
-    the measurements and the alternatives that were rejected.
-
-    The upstream own-repository probe used to run first, with the shared-
-    repository one behind it.  It is gone: its RHOAI spelling, rhoai-pr-<N>,
-    is published by nothing, so it was one authenticated skopeo inspect per
-    component per run that could not succeed.  A single probe remains.
-
-    The fallback tag must name the same release operator-processor resolves
-    against, or the snapshot references one release while the operands-map the
-    bundle is built from references another, and nothing in the chain notices.
-
-    So it is derived, not fixed.  rhoai-version is the one input that decides
-    the release for the whole run - the pipeline already forwards it to
-    operator-processor - and fallback-tag now comes from it: rhoai-${X.Y}.
-    This used to be a literal `rhoai-3.5` default that the pipeline never
-    overrode, which agreed with rhoai-version only by coincidence of two
-    independent constants.  Bumping rhoai-version to 3.6 would have left the
-    snapshot silently on 3.5.
-
-    fallback-tag is still accepted and still wins when set, for the case where
-    the two genuinely should differ.  What is not accepted is both being
-    empty: that would yield the tag `rhoai-`, which matches nothing, and every
-    component would drop out of the snapshot with no single error explaining
-    why.  That combination fails the task instead.
-
-    Measured across the 72 repos in the operator's operands-map, 66 carry a
-    rhoai-3.5 tag and 58 carry a rhoai-3.6 one, so neither release resolves
-    every component and the fallback missing some entries is normal.
-
-    As with resolve-group-configuration, leader-pr-repo/leader-pr-number are
-    accepted because the RHOAI early-gate pipeline is driven by the Leader PR
-    Manager rather than by PaC, so the pipelinesascode.tekton.dev labels this
-    task reads upstream are not present.
+  description: "Build a Konflux snapshot for the gated group, preferring each component's PR image over its released one"
   workspaces:
     - name: basic-auth
       optional: true
   params:
     - name: COMPONENTS
-      description: |
-        List of components in the group (JSON).
-        Format: {"comp1": "path1", "comp2": "path2"} OR
-                {"comp1": {"quay_path": "path1", "pr": "123"}, "comp2": {...}}
-        If empty, fetched from component_repo_map.json using REPO_NAME.
+      description: "List of components in the group (JSON)."
       default: ""
     - name: fallback-tag
       type: string
       default: ""
-      description: |
-        Quay tag to use when no PR image is found.  Leave empty to derive it
-        from rhoai-version as rhoai-<X.Y>, which is what keeps it in step with
-        the release operator-processor resolves against.  Set it only to pin
-        the snapshot to a different release on purpose.
+      description: "Quay tag to use when no PR image is found."
     - name: rhoai-version
       type: string
       default: ""
-      description: |
-        The release this gate run is for, accepted as "3.5", "rhoai-3.5" or
-        "3.5.2" - the same three shapes the pipeline's own rhoai-version
-        takes.  Only used to derive fallback-tag, and only when fallback-tag
-        is empty.  With both empty the task fails rather than fall back to a
-        tag that matches nothing.
+      description: "The release this gate run is for, accepted as 3.5, rhoai-3.5 or 3.5.2"
     - name: pr-pipelines-repo
       type: string
       default: rhoai/pull-request-pipelines
-      description: |
-        Shared Quay repository that RHOAI component PR pipelines publish to,
-        without the quay.io/ prefix.  Probed as <repo>:<component>-<commit>
-        when the component carries a head SHA.  Setting it empty disables the
-        only probe there is, so every component falls back to its release
-        image - a debugging lever, not a supported configuration.
+      description: "Shared Quay repository that RHOAI component PR pipelines publish to, without the quay.io/ prefix."
     - name: leader-pr-repo
       type: string
       default: ""
-      description: |
-        org/repo of the leader PR.  Overrides the PaC labels when set; leave
-        empty to resolve from the pipelinesascode.tekton.dev labels instead.
+      description: "org/repo of the leader PR."
     - name: leader-pr-number
       type: string
       default: ""
@@ -158,17 +90,7 @@ spec:
         set -e
         cat /etc/*release
 
-        # --- Resolve the fallback tag -------------------------------------
-        # An explicit fallback-tag wins.  Otherwise derive it from
-        # rhoai-version so the snapshot and operator-processor name the same
-        # release; see the task description for why they must agree.
-        #
-        # Three input shapes are accepted because rhoai-version carries all
-        # three in practice: "3.5" from the gate's own parameter, "rhoai-3.5"
-        # as the pipeline's description permits, and "3.5.2" from the release
-        # push files.  Strip the prefix, keep major.minor, and require that
-        # what is left actually looks like a release - an unrecognised value
-        # must fail here rather than become a tag that matches nothing.
+        # --- Resolve the fallback tag: an explicit one wins, else derive major.minor from rhoai-version ---
         if [[ -z "${FALLBACK_TAG}" ]]; then
           if [[ -z "${RHOAI_VERSION}" ]]; then
             echo "ERROR: neither fallback-tag nor rhoai-version was supplied." >&2
@@ -193,9 +115,7 @@ spec:
           echo "Using the explicitly supplied fallback tag ${FALLBACK_TAG}" >&2
         fi
 
-        # The basic-auth workspace carries the RHOAI Quay read-only robot
-        # credential; quay.io/rhoai is private.  It stays optional, so a group
-        # made up entirely of public repos still resolves without it.
+        # The basic-auth workspace carries the RHOAI Quay read-only robot credential; optional
         SKOPEO_AUTH=""
         if [[ "${WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND}" == "true" ]]; then
           AUTHFILE="${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.dockerconfigjson"
@@ -208,9 +128,7 @@ spec:
           fi
         fi
 
-        # --- Leader PR parameters win over the PaC labels ---
-        # See the task description: this pipeline is not PaC-triggered, so the
-        # fieldRefs above resolve to the empty string.
+        # --- Leader PR parameters win over the PaC labels: this pipeline is not PaC-triggered ---
         if [[ -n "${LEADER_PR_REPO}" ]]; then
           REPO_NAME="${LEADER_PR_REPO##*/}"
         fi
@@ -225,7 +143,7 @@ spec:
             exit 1
           fi
           echo "COMPONENTS not provided, fetching from component_repo_map.json for REPO_NAME=${REPO_NAME}" >&2
-          COMPONENT_MAP_URL="https://raw.githubusercontent.com/rhoai-rhtap/konflux-central/main/config/component_repo_map.json"
+          COMPONENT_MAP_URL="https://raw.githubusercontent.com/red-hat-data-services/konflux-central/main/config/component_repo_map.json"
           COMPONENT_MAP=$(curl -sSf "${COMPONENT_MAP_URL}")
           COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo]')
           if [[ -z "${COMPONENTS}" || "${COMPONENTS}" == "null" ]]; then
@@ -235,9 +153,7 @@ spec:
           echo "Fetched COMPONENTS for ${REPO_NAME}: ${COMPONENTS}" >&2
         fi
 
-        # An empty or absent group is a legitimate outcome, not a failure:
-        # resolve-group-configuration returns {} when the leader repo owns no
-        # components.  Normalise it so the jq below has an object to walk.
+        # An empty group is legitimate, not a failure; normalise it so the jq below has an object
         if [[ -z "${COMPONENTS}" || "${COMPONENTS}" == "null" ]]; then
           echo "No components to resolve - emitting an empty snapshot" >&2
           COMPONENTS="{}"
@@ -273,9 +189,7 @@ spec:
 
             component_sha=""
             if [[ "$value_type" == "object" ]]; then
-              # New format: {"quay_path": "...", "pr": "123", "sha": "abc..."}
-              # sha is optional - the leader repo's own components never carry
-              # one, and a child PR whose head could not be read has it empty.
+              # New format: {"quay_path": "...", "pr": "123", "sha": "abc..."}; sha is optional
               repo_path=$(echo "$value_raw" | jq -r '.quay_path')
               component_pr=$(echo "$value_raw" | jq -r '.pr')
               component_sha=$(echo "$value_raw" | jq -r '.sha // ""')
@@ -289,47 +203,14 @@ spec:
 
             echo "repo_path=${repo_path}"
 
-            # Where this component's image will be read from.  Both are
-            # rewritten by whichever probe below hits.
+            # Where this component's image will be read from; both are rewritten by whichever probe hits
             full_repo="quay.io/${repo_path}"
             TAG=""
             IMAGE_STATUS=""
 
-            # There used to be a probe ahead of this one, against the
-            # component's own repository at rhoai-pr-<N>.  That is an ODH
-            # convention: no RHOAI component publishes it, so it cost one
-            # authenticated skopeo inspect per component per run and could
-            # never hit.  Removed rather than kept "in case", because a probe
-            # that cannot succeed is indistinguishable in the log from one
-            # that failed, which is how its uselessness went unnoticed.
-            #
-            # --- Probe 1: the shared PR-pipelines repository, tagged by commit
-            # What RHOAI actually does.  Every component PR pipeline in
-            # red-hat-data-services/konflux-central publishes to the single
-            # repository quay.io/rhoai/pull-request-pipelines under the tag
-            # <component>-<commit>.  Before this probe existed, every
-            # component in every group fell straight through to the release
-            # tag - meaning the gate tested released images rather than the
-            # proposed ones.  See early-gate/PR-DIGESTS.md.
-            #
-            # <component>-<commit>, not the gate's own
-            # <component>-eg-<pr> shape.  Those two tags come from different
-            # pipelines: the eg- tags are what the gate's three blocks push
-            # for the operator, bundle and fragment it builds itself, while
-            # this probe is looking for images a component's own PR pipeline
-            # published - and that pipeline knows nothing about the gate.
-            # Probing for an eg- tag here would never hit.
-            #
-            # By commit rather than by PR number deliberately.  The secondary
-            # tag those pipelines emit, pr-<N>-into-<branch>, carries no
-            # component name: PR #42 in kserve and PR #42 in odh-dashboard
-            # write the same tag into the same repository and the second one
-            # wins.  The commit-qualified tag is unique, and every PR pipeline
-            # emits it.
+            # --- Probe 1: the shared PR-pipelines repository, tagged <component>-<commit>. See early-gate/PR-DIGESTS.md ---
             if [[ -z "${IMAGE_STATUS}" && -n "${PR_PIPELINES_REPO}" && -n "${component_sha}" ]]; then
-              # Map keys carry the release - odh-kserve-controller-v3-5 - but
-              # the shared repository's tags do not, because one PR pipeline
-              # serves every release branch.
+              # Map keys carry the release, the shared repository's tags do not
               pr_prefix=$(printf '%s' "${component}" | sed -E 's/-v[0-9]+-[0-9]+$//')
               pr_tag="${pr_prefix}-${component_sha}"
               pr_repo="quay.io/${PR_PIPELINES_REPO}"
@@ -368,17 +249,7 @@ spec:
             echo "Processing component: $component" >&2
             echo "Repository: $full_repo" >&2
 
-            # One authenticated skopeo inspect yields everything the snapshot
-            # records: the manifest-list digest and the git.url/git.commit
-            # labels.  This replaces a chain of quay.io/api/v1 calls, which
-            # could never work here - that is Quay's REST API and it requires
-            # an OAuth 2 application token, rejecting the robot pull
-            # credentials this task is handed.  The registry v2 API skopeo
-            # speaks accepts them.
-            #
-            # --override-arch/--override-os choose which child of a manifest
-            # list supplies .Labels.  .Digest remains the list digest, which
-            # is the one the snapshot must reference.
+            # One authenticated skopeo inspect yields the list digest and the git.url/git.commit labels
             if ! META=$(skopeo inspect ${SKOPEO_AUTH} --no-tags \
                           --override-arch amd64 --override-os linux \
                           "docker://${full_repo}:${TAG}" 2>&1); then
@@ -405,13 +276,7 @@ spec:
                 echo "Git Commit: $git_commit" >&2
             fi
 
-            # A component whose image cannot be resolved is omitted from the
-            # snapshot rather than taking the run down.  Not every repo a
-            # leader PR references publishes to quay.io/rhoai on the fallback
-            # tag - fork repos in particular push to their own tenant
-            # namespaces - and one such entry must not cost the whole gate.
-            # The omission is recorded, so a snapshot that is quietly thinner
-            # than the group is visible rather than silent.
+            # A component that cannot be resolved is omitted and recorded, rather than taking the run down
             if [ -z "$git_url" ] || [ -z "$git_commit" ]; then
                 echo "⚠️  WARNING: no resolvable image for ${component} (${full_repo}:${TAG})" >&2
                 echo "   Omitting it from the snapshot." >&2

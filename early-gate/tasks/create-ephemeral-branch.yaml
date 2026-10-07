@@ -3,27 +3,7 @@ kind: Task
 metadata:
   name: create-ephemeral-branch
 spec:
-  description: |
-    Forks an ephemeral branch from a known commit, via the GitHub refs API.
-
-    This is the DR-1 anti-pollution primitive.  RHOAI-Build-Config has no stable
-    EG branch, and the existing GitHub workflow (process-operator-bundle.yaml)
-    pushes processed bundle content straight to the release branch:
-
-        git push ${FORCE_FLAG} origin HEAD:${PUSH_BRANCH}   # PUSH_BRANCH = rhoai-X.Y
-
-    Replicating that would put temporary EG/PR image digests into rhoai-X.Y.  So
-    Block 2 never pushes there.  It forks a throwaway ref, does every write on it,
-    and deletes it when the gate is done.
-
-    Deliberately generic - repo, source SHA and branch name are all params, and
-    nothing here knows what a bundle is.  Block 3's FBC processing needs the same
-    fork on the same repo (DR-7a) and should reuse this task rather than grow a
-    second copy of the logic.
-
-    Forking from an explicit SHA rather than a branch name matters: the caller has
-    already cloned that commit, so the ephemeral branch and the clone are
-    guaranteed to be the same tree even if the release branch moves mid-run.
+  description: "Forks an ephemeral branch from a known commit, via the GitHub refs API."
   params:
   - name: repo
     type: string
@@ -59,10 +39,7 @@ spec:
         exit 1
       fi
 
-      # Guard against ever being pointed at a release branch.  This task can only
-      # create refs, not move them, but the name is the one thing a caller can get
-      # wrong in a way that would be silently destructive if the API semantics
-      # below ever changed.
+      # Guard against ever being pointed at a release branch: the name is the one thing a caller can get wrong
       case "${BRANCH}" in
         eg-*) ;;
         *)
@@ -78,8 +55,7 @@ spec:
         -X POST "https://api.github.com/repos/${REPO}/git/refs" \
         -d "{\"ref\":\"refs/heads/${BRANCH}\",\"sha\":\"${SOURCE_SHA}\"}")
 
-      # 422 is "ref already exists".  A re-run of the same gate should be
-      # idempotent, so reset the branch to the fork point rather than failing.
+      # 422 is "ref already exists"; a re-run should be idempotent, so reset to the fork point
       if [ "${HTTP_CODE}" = "422" ]; then
         echo "Branch ${BRANCH} already exists - resetting it to ${SOURCE_SHA}"
         PATCH_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \

@@ -3,19 +3,7 @@ kind: Task
 metadata:
   name: clone-build-config-repo
 spec:
-  description: |
-    Resolves the latest Y-stream release branch on RHOAI-Build-Config and clones
-    it into a trusted artifact.
-
-    Upstream ODH uses the stock git-clone-oci-ta task here, because it is handed a
-    fixed build-config-revision.  This one cannot be: DR-1a asks for the *latest*
-    rhoai-X.Y to be discovered at run time, and git-clone-oci-ta has nowhere to put
-    that discovery.  So the resolve and the clone live in one task, and the branch
-    it settled on comes back as a result for everything downstream to agree on.
-
-    Nothing here writes to the release branch.  The clone is read-only; every write
-    in Block 2 lands on the ephemeral branch that create-ephemeral-branch forks
-    from the release-sha this task reports.
+  description: "Resolves the latest Y-stream release branch on RHOAI-Build-Config and clones it into a trusted artifact."
   params:
   - name: REPO_URL
     type: string
@@ -24,10 +12,7 @@ spec:
   - name: BRANCH_OVERRIDE
     type: string
     default: ""
-    description: |
-      Pin the release branch instead of discovering it.  Empty means "resolve the
-      latest rhoai-X.Y", which is the normal path.  Set it to reproduce an old run
-      or to gate against a branch that is not yet the newest.
+    description: "Pin the release branch instead of discovering the latest rhoai-X.Y; empty is the normal path"
   - name: ociStorage
     type: string
     description: OCI storage location for the output trusted artifact
@@ -38,20 +23,13 @@ spec:
   - name: SOURCE_ARTIFACT
     description: Trusted artifact holding the RHOAI-Build-Config working tree
   - name: release-branch
-    description: |
-      The branch that was resolved and cloned - a discovered rhoai-X.Y, or
-      whatever BRANCH_OVERRIDE named.
+    description: "The branch that was resolved and cloned - a discovered rhoai-X.Y, or whatever BRANCH_OVERRIDE named."
   - name: release-sha
     description: Head commit of that branch, and the point the ephemeral branch forks from
   - name: rhoai-version
-    description: |
-      The X.Y portion of release-branch, e.g. 3.6.  Empty when release-branch
-      is not a rhoai-X.Y branch, which is the normal case under BRANCH_OVERRIDE.
+    description: "The X.Y portion of release-branch, e.g. 3.6."
   - name: component-suffix
-    description: |
-      The vX-Y form used in RHOAI component and .tekton file names, e.g. v3-6.
-      Derived here so no downstream task has to re-parse the branch name.
-      Empty under the same condition as rhoai-version.
+    description: "The vX-Y form used in RHOAI component and .tekton file names, e.g. v3-6."
   volumes:
   - name: workdir
     emptyDir: {}
@@ -77,18 +55,7 @@ spec:
         BRANCH="${BRANCH_OVERRIDE}"
         echo "Release branch pinned by BRANCH_OVERRIDE: ${BRANCH}"
       else
-        # Same idiom operator-processor.yaml uses to pick a default release
-        # branch, and deliberately so - Block 1 and Block 2 must never disagree
-        # about which release is current.
-        #
-        # The rhoai- prefix is stripped before sorting because "rhoai-2" and
-        # "rhoai-3" both sort numerically as 0, which would pick rhoai-2.25 over
-        # rhoai-3.5.  The [23] major filter matches operator-processor's push
-        # filters and skips placeholders like rhoai-99.99.
-        #
-        # ^[23]\.[0-9]+$ is strict on purpose: it admits rhoai-3.6 and rejects
-        # rhoai-3.6-ea.1, rhoai-3.5.1 and rhoai-3.6-ea.1-dry-run-nightly-bundle.
-        # Only a plain Y-stream branch is a valid gate target (DR-1a).
+        # Same idiom operator-processor.yaml uses; the prefix is stripped before sorting so rhoai-3.5 beats rhoai-2.25
         LATEST=$(git ls-remote --heads "${REPO_URL}" 'refs/heads/rhoai-*' \
           | sed 's|.*refs/heads/rhoai-||' \
           | grep -E '^[23]\.[0-9]+$' \
@@ -105,21 +72,7 @@ spec:
       git clone --depth 1 --branch "${BRANCH}" "${REPO_URL}" /var/workdir/source
       SHA=$(git -C /var/workdir/source rev-parse HEAD)
 
-      # Only meaningful for a rhoai-X.Y branch.  ${BRANCH#rhoai-} is a no-op on
-      # anything else, so with BRANCH_OVERRIDE=gap-poc these used to come out as
-      # version "gap-poc" and suffix "vgap-poc", and on a branch with a slash in
-      # it the suffix would have carried the slash into what reads like a
-      # component name.  Nothing consumes either result today - the pipeline
-      # uses release-branch, release-sha and SOURCE_ARTIFACT only - so this was
-      # latent rather than broken, and the point of emptying them is that a
-      # future consumer gets nothing instead of getting nonsense.
-      # The test is the rhoai- prefix, not the stricter ^[23]\.[0-9]+$ the
-      # discovery above applies.  Discovery decides which branch is a valid
-      # gate target; this only decides whether stripping the prefix produces a
-      # version, and it does for every rhoai-* branch - rhoai-3.5-ea.1 gives
-      # 3.5-ea.1 and v3-5-ea-1, exactly as before.  Being stricter here would
-      # change behaviour for BRANCH_OVERRIDE=rhoai-3.5-ea.1, which is a real
-      # way to reproduce an old run and is none of this block's business.
+      # Only meaningful for a rhoai-X.Y branch; anything else leaves both results empty rather than nonsense
       if [ "${BRANCH}" != "${BRANCH#rhoai-}" ]; then
         VERSION="${BRANCH#rhoai-}"
         SUFFIX="v${VERSION//./-}"

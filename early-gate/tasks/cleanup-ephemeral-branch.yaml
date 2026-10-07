@@ -3,54 +3,18 @@ kind: Task
 metadata:
   name: cleanup-ephemeral-branch
 spec:
-  description: |
-    Deletes an ephemeral branch (DR-1e), or deliberately leaves it in place
-    (DR-1f).
-
-    create-ephemeral-branch always creates a branch, so something must always
-    remove it, or every run leaves an orphan on RHOAI-Build-Config.  Deleting it
-    is safe for Block 2 as it stands: the bundle image is tagged by commit -
-    eg-<sha> - and that tag does not depend on the ref still existing, so
-    monitor-pac-build has already read back everything Block 3 needs.
-
-    The deferral is the DR-1f hook.  Block 3 is not written yet, and there are two
-    plausible shapes for it:
-
-      Block 3 forks its own branch from the release branch, and takes the bundle
-      digest from Block 2's BUNDLE_IMAGE_REF_BY_DIGEST result.  Then Block 2's
-      branch is dead the moment its build is green, and cleanup runs normally.
-      This is the shape Block 2 is designed for and the one to prefer - it keeps
-      each block's branch lifetime inside that block.
-
-      Block 3 forks from Block 2's branch, to inherit the processed bundle/
-      content.  Then deleting Block 2's branch before Block 3 has forked breaks
-      Block 3, and the orchestrating pipeline must set defer-cleanup=true and own
-      the deletion itself once both blocks are done.
-
-    Which one applies is Block 3's decision, not Block 2's, so the switch exists
-    and defaults to deleting.  A deferred branch is reported loudly, with the
-    delete command, because a "cleanup" task that silently cleans nothing up is
-    how orphan branches accumulate.
-
-    Intended to run in `finally`.  A caller MUST pass a branch name it can compute
-    from params and context rather than from another task's result: a finally task
-    that references a failed task's result is skipped entirely, which is exactly
-    when cleanup matters most.
+  description: "Deletes an ephemeral branch (DR-1e), or deliberately leaves it in place (DR-1f)."
   params:
   - name: repo
     type: string
     description: org/repo the branch lives in
   - name: branch-name
     type: string
-    description: |
-      Branch to delete. Compute this from params and $(context.pipelineRun.*),
-      never from a task result - see the note above.
+    description: "Branch to delete."
   - name: defer-cleanup
     type: string
     default: "false"
-    description: |
-      When "true", report the branch and leave it. For the case where a later
-      block still needs it (DR-1f, DR-7d).
+    description: "When \"true\", report the branch and leave it."
   results:
   - name: cleanup-status
     description: deleted, absent, deferred, or failed
@@ -68,11 +32,7 @@ spec:
       BRANCH="$(params.branch-name)"
       DEFER="$(params.defer-cleanup)"
 
-      # The same guard create-ephemeral-branch applies, for the same reason and
-      # with more at stake: this task calls DELETE on a ref. If a caller ever
-      # computes the branch name wrongly - an unresolved variable collapsing to
-      # the release branch, say - this is the line between a no-op and deleting
-      # rhoai-3.6.
+      # The same guard create-ephemeral-branch applies, with more at stake: this task calls DELETE on a ref
       case "${BRANCH}" in
         eg-*) ;;
         *)
@@ -112,8 +72,7 @@ spec:
           echo -n "absent" > $(results.cleanup-status.path)
           ;;
         *)
-          # Not a task failure. This runs in finally, and failing here would
-          # mask whatever real problem the pipeline was already reporting.
+          # Not a task failure: this runs in finally and would mask the real problem
           echo "Could not delete ${BRANCH} (HTTP ${CODE}) - it may need removing by hand:" >&2
           echo "  gh api -X DELETE repos/${REPO}/git/refs/heads/${BRANCH}" >&2
           echo -n "failed" > $(results.cleanup-status.path)

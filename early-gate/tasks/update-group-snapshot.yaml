@@ -3,54 +3,18 @@ kind: Task
 metadata:
   name: update-group-snapshot
 spec:
-  description: |
-    Injects Block 1's operator image digest into the bundle inputs, before
-    bundle-processor runs (DR-2).
-
-    Two files are written, and it is worth being precise about which one actually
-    matters, because upstream ODH and downstream RHOAI differ here:
-
-      bundle/bundle-patch.yaml   LOAD-BEARING.  RHOAI's bundle-processor.py reads
-                                 the operator image out of the patch file's
-                                 relatedImages (fetch_operator_metadata filters on
-                                 ODH_OPERATOR).  This entry is the only channel
-                                 through which the Block 1 digest reaches the CSV.
-
-      config/snapshot.json       NOT read by bundle-patch.  The -sn/--snapshot-json-path
-                                 flag exists, but it feeds a separate
-                                 snapshot_processor class; the bundle-patch
-                                 operation never constructs one.  It is written
-                                 anyway, for parity with upstream, for the audit
-                                 trail, and because Block 3 wants the group pinned
-                                 somewhere it can read.
-
-    Upstream's bundle-processor.yaml does the same jq/yq seeding inline, inside the
-    processing step.  DR-2a asks for it to be an explicit task ahead of the
-    processor, which is also the better shape: the injection is now visible as its
-    own green/red step, and verify-bundle-images has something to compare against.
+  description: "Injects Block 1's operator image digest into the bundle inputs, before bundle-processor runs (DR-2)."
   params:
   - name: SOURCE_ARTIFACT
     type: string
     description: Trusted artifact holding the RHOAI-Build-Config working tree
   - name: SNAPSHOT_ARTIFACT
     type: string
-    description: |
-      Trusted artifact from generate-snapshot containing snapshot.json for the
-      whole gated group.  It seeds config/snapshot.json, so the group's component
-      digests travel with the bundle inputs.
-
-      Required, unlike upstream's, which defaults to "".  That default cannot
-      work: the use-trusted-artifact step passes
-      "$(params.SNAPSHOT_ARTIFACT)=/var/workdir/snapshot" as an argument, and an
-      empty value makes it "=/var/workdir/snapshot", which fails at the step
-      rather than degrading to "no snapshot supplied".
+    description: "Trusted artifact from generate-snapshot containing snapshot.json for the whole gated group."
   - name: OPERATOR_IMAGE_REF_BY_DIGEST
     type: string
     default: ""
-    description: |
-      Block 1's OPERATOR_IMAGE_REF_BY_DIGEST - <repo>@sha256:...  Preferred, because
-      it cannot be reassembled wrongly.  When empty, the URL and digest below are
-      combined instead.
+    description: "Block 1's OPERATOR_IMAGE_REF_BY_DIGEST, as <repo>@<digest>"
   - name: OPERATOR_IMAGE_URL
     type: string
     default: ""
@@ -74,12 +38,7 @@ spec:
   - name: operator-image
     description: The fully-qualified operator image by digest that was injected
   - name: operator-component-name
-    description: |
-      The component name bundle-processor.py will derive from the RELEASE operator
-      image path (e.g. odh-rhel9-operator).  Captured before the patch, because
-      after it the path points at the EG namespace and the derivation changes.
-      bundle-processor uses this to keep build-arg keys stable - see the
-      normalise-operator-build-args step there.
+    description: "The component name bundle-processor.py will derive from the RELEASE operator image path (e.g. odh-rhel9-operator)."
   volumes:
   - name: workdir
     emptyDir: {}
@@ -133,9 +92,7 @@ spec:
         exit 1
       fi
 
-      # An EG bundle must reference the operator by digest.  A tag - even an EG
-      # tag - is mutable, and monitor-operator-build warns rather than fails when
-      # it cannot resolve one, so an empty or tag-shaped value can reach here.
+      # An EG bundle must reference the operator by digest; a tag is mutable, and an empty value can reach here
       case "${OPERATOR_IMAGE}" in
         *@sha256:*) ;;
         *)
@@ -148,13 +105,7 @@ spec:
 
       PATCH_YAML="${SOURCE}/bundle/bundle-patch.yaml"
 
-      # --- Capture the pre-patch component name ----------------------------
-      # bundle-processor.py derives build-arg keys from the image path:
-      # parse_image_value() takes everything after the org as the repo, and
-      # generate_bundle_build_args() upper-cases it.  The release path
-      # quay.io/rhoai/odh-rhel9-operator yields ODH_RHEL9_OPERATOR_GIT_URL, which
-      # is the ARG name bundle/Dockerfile actually declares.  Read it now, while
-      # the entry still holds the release path.
+      # --- Capture the pre-patch component name: the release path yields the ARG bundle/Dockerfile declares ---
       RELEASE_OPERATOR_IMAGE=$(yq -r \
         '.patch.relatedImages[] | select(.name == "RELATED_IMAGE_ODH_OPERATOR_IMAGE") | .value' \
         "${PATCH_YAML}" | head -1)

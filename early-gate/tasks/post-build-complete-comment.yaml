@@ -6,39 +6,7 @@ metadata:
   labels:
     app.kubernetes.io/version: "0.1"
 spec:
-  description: |
-    RHOAI adaptation of opendatahub-io/odh-konflux-central's
-    early-gate/tasks/post-build-complete-comment.yaml.  Posts the gate's
-    verdict as a comment on the leader PR.
-
-    Four things differ from upstream, and all four follow from this gate
-    having three blocks where ODH has one.
-
-    1. Upstream reads the PR off the pipelinesascode.tekton.dev labels,
-       because it always runs inside a PaC-triggered PipelineRun.  This gate
-       is driven by the Leader PR Manager, so leader-pr-repo and
-       leader-pr-number are passed in - the same change
-       resolve-group-configuration already carries.
-
-    2. Upstream takes its token from a secretKeyRef.  Here it comes from the
-       github-credentials workspace, which is what every other task in this
-       pipeline reads and what the eg-github-token secret is already mounted
-       as.  One credential path, not two.
-
-    3. Upstream reports one image, the FBC fragment.  This reports all three
-       block outputs by digest, with the DR-6/DR-F6 verification state
-       alongside the two that have one.
-
-    4. Upstream runs in the tasks section after the build, so it only ever
-       posts on success.  This runs from finally and takes a status param, so
-       a failed gate says so on the PR instead of going quiet.  See the two
-       call sites in early-gate-component-pipeline.yaml for why that needs
-       two invocations rather than one.
-
-    Every artifact param defaults to empty.  The failure call site passes
-    almost none of them - a finally task that references a result of a task
-    that failed is skipped by Tekton, which is precisely the run that most
-    needs a comment - so the body has to render from statuses alone.
+  description: "Post the gate's verdict for all three blocks as a comment on the leader PR"
   workspaces:
   - name: github-credentials
     description: Secret workspace holding a 'token' key with a GitHub API token
@@ -55,9 +23,7 @@ spec:
   # --- Verdict ---
   - name: status
     type: string
-    description: |
-      "success" or "failure".  Decides the heading and whether the artifact
-      table is rendered at all; anything else is treated as a failure.
+    description: "\"success\" or \"failure\"."
 
   # --- Run context ---
   - name: rhoai-version
@@ -75,12 +41,7 @@ spec:
   - name: fallback-source-branch
     type: string
     default: ""
-    description: |
-      Compared against source-branch to decide whether to label the run as
-      having fallen back.  This is the branch-level fallback - the gate could
-      not find an operator PR in the group, so it built the release branch's
-      operator instead.  Distinct from fallback-warning below, which is about
-      individual component images, and the comment says which is which.
+    description: "Compared against source-branch to decide whether to label the run as having fallen back."
   - name: operator-pr-included
     type: string
     default: ""
@@ -88,16 +49,7 @@ spec:
     type: string
     default: ""
 
-  # --- Block outputs ---
-  # Both the digest ref and the tagged ref, for each block, and the second
-  # is not redundant.  All three blocks publish to one shared repository -
-  # quay.io/rhoai/pull-request-pipelines, which is RHOAI's convention for
-  # non-release artifacts - and what distinguishes them is the leading
-  # segment of the TAG: rhods-operator-..., odh-operator-bundle-...,
-  # rhoai-fbc-fragment-....  A digest ref carries no tag, so a table built
-  # from the *-image params alone prints the same repository name three
-  # times and the reader cannot tell the operator from the fragment.  That
-  # is what run 18's comment looked like.
+  # --- Block outputs: the digest ref and the tagged ref, since one shared repo is told apart by tag prefix ---
   - name: operator-image
     type: string
     default: ""
@@ -138,10 +90,7 @@ spec:
     type: string
     default: ""
 
-  # --- Per-block Tekton status, for the failure path ---
-  # $(tasks.<name>.status) is readable from finally whatever happened to the
-  # task, which is why the failure call site can name the block that broke
-  # without consuming a single result.
+  # --- Per-block Tekton status, for the failure path: readable from finally whatever happened ---
   - name: operator-task-status
     type: string
     default: ""
@@ -172,10 +121,7 @@ spec:
   - name: fallback-warning
     type: string
     default: ""
-    description: |
-      generate-snapshot's note about components whose PR build was not ready,
-      so the snapshot used the release tag instead.  Image-level fallback, as
-      opposed to the branch-level one described on fallback-source-branch.
+    description: "generate-snapshot's note about components whose PR build was not ready, so the snapshot used the release tag instead."
   - name: invalid-repo-warnings
     type: string
     default: ""
@@ -188,18 +134,11 @@ spec:
   - name: component-pr-org
     type: string
     default: "red-hat-data-services"
-    description: |
-      Org the group's component PRs live in, used only to build links.
-      Upstream hardcodes opendatahub-io; here the child PRs are in
-      red-hat-data-services while the forks the gate builds are in
-      rhoai-rhtap, so the two cannot be the same constant.
+    description: "Org the group's component PRs live in, used only to build links."
   - name: component-map-url
     type: string
-    default: "https://raw.githubusercontent.com/rhoai-rhtap/konflux-central/main/config/component_repo_map.json"
-    description: |
-      Used to turn a component name back into a repo for the PR link.
-      Fetched anonymously and allowed to fail - the table degrades to bare
-      PR numbers rather than the task failing over a cosmetic link.
+    default: "https://raw.githubusercontent.com/red-hat-data-services/konflux-central/main/config/component_repo_map.json"
+    description: "Used to turn a component name back into a repo for the PR link."
 
   steps:
   - name: post-comment
@@ -277,16 +216,13 @@ spec:
       value: $(workspaces.github-credentials.path)
     script: |
       #!/bin/bash
-      # No set -x anywhere in this script, deliberately: the token is read a
-      # few lines down and a trace would put it in the task log.
+      # No set -x anywhere, deliberately: the token is read below and a trace would log it
       set -euo pipefail
 
       BODY=/tmp/comment.md
       : > "${BODY}"
 
-      # Markdown table cells cannot contain a newline or an unescaped pipe,
-      # and most of what goes in them arrives as a free-text param.  Used on
-      # everything that lands inside a | ... | cell.
+      # Markdown cells cannot hold a newline or an unescaped pipe; used on everything that lands in one
       cell() {
         printf '%s' "$1" | tr '\n' ' ' | sed 's/|/\\|/g; s/[[:space:]]\+/ /g; s/^ //; s/ $//'
       }
@@ -318,12 +254,7 @@ spec:
         echo "| **Status** | ${STATUS_CELL} |"
       } >> "${BODY}"
 
-      # --- Where the operator source came from ---------------------------
-      # Two different things get called "fallback" around this gate, and
-      # conflating them has already cost one debugging session: this one is
-      # "no operator PR in the group, so the gate built the release branch's
-      # operator".  The other, further down, is "a component's PR image was
-      # not ready, so the snapshot used its release tag".
+      # --- Where the operator source came from: no operator PR in the group means the release branch ---
       if [ -n "${SOURCE_BRANCH}" ]; then
         FORKED="\`${SOURCE_BRANCH}\`"
         if [ -n "${FALLBACK_SOURCE_BRANCH}" ] && \
@@ -350,9 +281,7 @@ spec:
         esac
       }
 
-      # Split a ref into its parts.  The colon that introduces a tag is the
-      # one after the last slash - a registry may carry a :port - and a
-      # digest ref has an @ instead.
+      # Split a ref into its parts; the tag colon is the one after the last slash, a digest ref uses @
       ref_repo() {
         case "${1##*/}" in
           *@*) printf '%s' "${1%@*}" ;;
@@ -374,12 +303,7 @@ spec:
       }
 
       if [ -n "${OPERATOR_IMAGE}${BUNDLE_IMAGE}${FBC_IMAGE}" ]; then
-        # The repository is stated once, above the table, rather than
-        # repeated in all three rows.  It is the same string every time -
-        # one shared repo is the RHOAI convention for non-release builds,
-        # and being a different repo from the release ones is what makes a
-        # collision with a release digest impossible - so repeating it
-        # three times crowds out the part that actually differs.
+        # The repository is stated once above the table rather than repeated in all three rows
         ARTIFACT_REPO=$(ref_repo "${OPERATOR_IMAGE:-${BUNDLE_IMAGE:-${FBC_IMAGE}}}")
 
         {
@@ -387,8 +311,7 @@ spec:
           echo "**Artifacts**"
           echo
           if [ -n "${ARTIFACT_REPO}" ]; then
-            # Backticks unescaped: this is a single-quoted printf format, so a
-            # backslash would reach the comment verbatim as \`.
+            # Backticks unescaped: a single-quoted printf format, so a backslash would reach the comment verbatim
             printf 'All three in `%s`, told apart by the component prefix on the tag.\n\n' "$(cell "${ARTIFACT_REPO}")"
           fi
           echo "| Block | Tag | Digest | Verified |"
@@ -409,8 +332,7 @@ spec:
         } >> "${BODY}"
 
         if [ -n "${FBC_IMAGE}" ]; then
-          # printf rather than echo for the whole sentence: the catalog path is
-          # a mid-sentence clause, and an echo would end the line before it.
+          # printf rather than echo: the catalog path is a mid-sentence clause
           CATALOG_CLAUSE=""
           if [ -n "${FBC_CATALOG_PATH}" ]; then
             CATALOG_CLAUSE=" (regenerated from \`${FBC_CATALOG_PATH}\`)"
@@ -421,9 +343,7 @@ spec:
           } >> "${BODY}"
         fi
       else
-        # Failure path.  No results are readable here, so the only thing that
-        # can be said about each block is its Tekton status - which is enough
-        # to point at the one that broke.
+        # Failure path. No results are readable here, so each block can only report its Tekton status
         block_state() {
           case "$1" in
             Succeeded) printf ':white_check_mark: passed' ;;
@@ -500,19 +420,7 @@ spec:
           echo "| ${PR_LINK} | $(cell "${comp}") | \`$(cell "${tag}")\` | ${STATUS_TEXT} | \`$(cell "${digest}")\` |" >> "${BODY}"
         done <<< "${COMPONENT_TABLE}"
 
-        # The other fallback: component images, not the operator branch.
-        #
-        # Collapsed, and not quoted with a leading "> ".  Both follow from run
-        # 18, where all fourteen components fell back: `echo "> ${VAR}"`
-        # prefixes only the FIRST line of a multi-line value, so thirteen
-        # entries rendered outside the blockquote, and the list restated what
-        # the Status column of the table above had already said on every row.
-        #
-        # The count is worth having in the summary line even collapsed.  This
-        # is the condition under which the gate certifies released component
-        # images rather than the proposed ones - green, but not testing what
-        # the leader PR asked it to test - so it should be legible without
-        # expanding anything.
+        # The other fallback: component images, not the operator branch. Collapsed, with the count in the summary
         if [ -n "$(trimmed "${FALLBACK_WARNING}")" ]; then
           FALLBACK_COUNT=$(printf '%s\n' "${FALLBACK_WARNING}" | grep -c '^- Component' || true)
           COMPONENT_ROWS=$(printf '%s\n' "${COMPONENT_TABLE}" | grep -c '[^[:space:]]' || true)
@@ -581,9 +489,7 @@ spec:
 
       jq -Rs '{body: .}' < "${BODY}" > /tmp/payload.json
 
-      # Not -f/-sSf: a gate that already has its verdict should not be turned
-      # red a second time because GitHub rate-limited the comment.  The code
-      # is reported instead, which is what upstream does too.
+      # Not -f/-sSf: a gate that has its verdict should not go red again over a rate-limited comment
       CODE=$(curl -sS -o /tmp/response.json -w '%{http_code}' \
         -X POST \
         -H "Authorization: token ${TOKEN}" \

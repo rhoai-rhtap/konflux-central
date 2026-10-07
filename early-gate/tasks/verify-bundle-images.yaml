@@ -3,50 +3,14 @@ kind: Task
 metadata:
   name: verify-bundle-images
 spec:
-  description: |
-    Asserts that the processed bundle references early-gate images and not release
-    ones (DR-6).  This is the task that makes the smoke test mean something: it is
-    the difference between "the bundle built" and "the bundle built from the
-    collaborator PRs".
-
-    It scans the generated CSV, bundle_build_args.map and bundle-patch.yaml, and
-    applies four checks:
-
-      1. Every image reference is pinned by digest.  A floating tag is the
-         signature of a release-tag lookup having leaked in, so this fails
-         regardless of what the tag says.
-      2. No image reference carries a release tag - rhoai-X.Y, odh-stable,
-         *-nightly, latest.
-      3. The operator relatedImage is exactly Block 1's image.  Not the same
-         repository, not the same tag: the same digest.
-      4. Every gated component in the group snapshot appears in the bundle at the
-         digest the snapshot pinned.  This is the check that catches the
-         interesting failure - a component whose PR was gated but whose release
-         digest ended up in the CSV anyway.
-
-    On check 4, a component the snapshot pinned but the bundle never mentions is
-    reported rather than failed by default: not every gated component is
-    represented in the operator bundle.  STRICT_MODE turns that into a failure for
-    a run where the group is known to be bundle-visible.
-
-    Components that are NOT in the gate legitimately keep their release digests -
-    only a handful of PRs are gated at a time, and the rest of the bundle is
-    supposed to be the current release content.  Those are listed as informational
-    output, because the smoke test wants to see the split, but they are not
-    failures.  A check that demanded every image be EG-built would fail every
-    realistic run.
+  description: "Asserts that the processed bundle references early-gate images and not release ones (DR-6)."
   params:
   - name: SOURCE_ARTIFACT
     type: string
     description: Trusted artifact holding the processed bundle
   - name: SNAPSHOT_ARTIFACT
     type: string
-    description: |
-      Group snapshot artifact, used for check 4.  Required: the
-      use-trusted-artifact step interpolates it into
-      "<value>=/var/workdir/snapshot", so an empty value fails the step rather
-      than degrading to "no snapshot supplied".  The script still tolerates an
-      artifact that carries no snapshot.json, and reports check 4 as skipped.
+    description: "Group snapshot artifact, used to check that every gated component appears in the bundle"
   - name: OPERATOR_IMAGE
     type: string
     description: Block 1's operator image by digest, as injected by update-group-snapshot
@@ -56,9 +20,7 @@ spec:
   - name: STRICT_MODE
     type: string
     default: "false"
-    description: |
-      When "true", a gated component absent from the bundle is a failure rather
-      than a report.
+    description: "When \"true\", a gated component absent from the bundle is a failure rather than a report."
   results:
   - name: verified
     description: '"true" when every check passed'
@@ -115,9 +77,7 @@ spec:
       BUILD_ARGS = SOURCE / "bundle" / "bundle_build_args.map"
       PATCH = SOURCE / "bundle" / "bundle-patch.yaml"
 
-      # Only these registries are treated as image references.  Anchoring on a
-      # known host list rather than a generic "looks like a path" pattern keeps
-      # documentation URLs and Go module paths out of the results.
+      # Only these registries count as image references, so doc URLs and Go module paths stay out
       REGISTRIES = (
           "quay.io",
           "registry.redhat.io",
@@ -130,14 +90,7 @@ spec:
           r"(?:@sha256:[a-fA-F0-9]{64}|:[A-Za-z0-9._-]+)"
       )
 
-      # Tags that mean "this came from the release, not from the gate".  The
-      # branch we forked from is included by name, so a gate against rhoai-3.7
-      # rejects rhoai-3.7 even if the generic pattern is ever loosened.
-      #
-      # odh-pr/odh-pr-<N> is the odd one out: it is not a release tag, it is
-      # upstream ODH's per-PR tag.  Rejected all the same, because the thing
-      # being verified is that every operand the gate ships came from this
-      # gate run, and an ODH PR image is no more that than a released one is.
+      # Tags meaning "from the release, not the gate". odh-pr is upstream ODH's per-PR tag, rejected all the same
       FORBIDDEN_TAGS = {t for t in (RELEASE_BRANCH, "odh-stable", "latest", "stable") if t}
       FORBIDDEN_TAG_RE = re.compile(
           r"^(?:rhoai-\d+\.\d+(?:[.-].*)?|odh-stable|odh-pr(?:-.*)?"
@@ -158,11 +111,7 @@ spec:
           return IMAGE_RE.findall(path.read_text())
 
 
-      # (path, enforced).  The CSV and the build args are the bundle's actual
-      # output and are enforced.  bundle-patch.yaml is an input template - it is
-      # scanned so its contents show up in the log and in the counts, but a
-      # finding there is reported rather than failed, because anything wrong in
-      # the patch necessarily reappears in the CSV, where it does fail.
+      # (path, enforced). bundle-patch.yaml is an input template, so a finding there is reported, not failed
       SCAN_TARGETS = [
           ("CSV", CSV, True),
           ("bundle_build_args.map", BUILD_ARGS, True),
@@ -212,8 +161,7 @@ spec:
           if OPERATOR_IMAGE in csv_text:
               print(f"OK  operator image present in CSV: {OPERATOR_IMAGE}")
           elif op_digest in csv_text:
-              # Digest matches but the path does not - the registry/repo
-              # replacement in build-config.yaml rewrote it. Same image.
+              # Digest matches but the path does not: build-config.yaml's registry/repo replacement. Same image.
               print(f"OK  operator digest present in CSV under a replaced path: {op_digest}")
           else:
               failures.append(
@@ -235,10 +183,7 @@ spec:
               "carry their gated digests) was skipped."
           )
 
-      # Index the bundle's references by repository basename.  The basename
-      # survives build-config.yaml's registry/repo replacement, which maps
-      # quay.io/rhoai/<repo> to registry.redhat.io/rhoai/<repo>, so it is the
-      # stable join key between the snapshot and the CSV.
+      # Index by repository basename: it survives build-config.yaml's registry/repo replacement
       bundle_by_basename = {}
       for ref in all_refs:
           if "@sha256:" not in ref:

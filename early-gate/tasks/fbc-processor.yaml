@@ -3,101 +3,11 @@ kind: Task
 metadata:
   name: fbc-processor
 spec:
-  description: |
-    Runs RHOAI's fbc-processor.py over the RHOAI-Build-Config working tree,
-    producing a catalog/<ocp-version>/rhods-operator/catalog.yaml that carries the
-    early-gate bundle rather than the release one.
-
-    Adapted from opendatahub-io/odh-konflux-central's early-gate/tasks/fbc-processor.yaml.
-    The structure is upstream's; several details are not, because the ODH and
-    RHOAI forks of RHOAI-Konflux-Automation have diverged in the same way they did
-    for the bundle processor:
-
-      upstream (odh branch)          here (main branch)
-      ---------------------          ------------------
-      -q <quay tag>                  -v <rhoai version>   (there is no -q)
-      -v <source dir>                -v is the tag, not a path
-      --catalog-build-args-file-path -cba (the long form still works)
-      pcc/catalog-<ocp>.yaml         no pcc/ in this repo - see "-c" below
-
-    DR-F2 (bundle reference configurable).  Two separate things have to be right.
-
-      The bundle the FBC points at.  The semver template's .stable.bundles[0].image
-      is overwritten with <BUNDLE_IMAGE_URL minus its tag>@<BUNDLE_IMAGE_DIGEST>,
-      i.e. Block 2's output pinned by digest.  Both are required params with no
-      default, and the digest is rejected below unless it is sha256-shaped - an
-      empty BUNDLE_IMAGE_DIGEST is exactly the failure mode monitor-pac-build
-      warns about rather than failing on, and it must not be allowed to degrade
-      into "render whatever the template happened to contain".
-
-      The tag images are looked up by.  RHOAI's processor has no -q; the knob is
-      -v/--rhoai-version, used as `version_tag = self.rhoai_version` in
-      snapshot_processor.get_all_latest_images.  QUAY_TAG is wired to it, is
-      required, and is rejected if it looks like a release tag (DR-F2d), exactly
-      as bundle-processor.yaml does for DR-3d.
-
-    Why extract-snapshot-images is tolerated rather than required.  Its only two
-    outputs are snapshot_images.json - whose bundle entry this task overwrites one
-    line later, in both the release workflow and upstream's task - and
-    catalog/catalog_build_args.map, which feeds the FBC image's git.url/git.commit
-    LABELs.  Those are provenance, not function: catalog/vX.YY/Dockerfile declares
-    every ARG with an empty default and uses them only in LABEL lines.
-
-    On an early-gate run the lookup cannot succeed anyway.  It walks
-    build-config.yaml's repo_mappings, asks quay.io/rhoai for tag ${QUAY_TAG}, and
-    requires a <digest>.sig cosign signature tag alongside it.  QUAY_TAG is an
-    eg-<sha> tag that exists under quay.io/redhat-user-workloads, unsigned - so
-    the lookup finds nothing, and with RHOAI_QUAY_API_TOKEN empty it finds nothing
-    noisily.  Making the gate depend on that would be making it depend on release
-    Quay state, which is the thing DR-F2 exists to prevent.  So the step runs - it
-    is part of DR-F3's four steps and its wiring is what makes QUAY_TAG traceable
-    - and a non-zero exit is reported and stepped over.
-
-    Why --purge-bundles is computed and passed.  This is the trap that would
-    otherwise make the whole block a silent no-op.  fbc_processor.patch_olm_bundles
-    adds the rendered bundle to the catalog only when its name is not already
-    there:
-
-        if current_bundle_name not in self.catalog_dict[SCHEMA]:
-            ...
-            patched = True
-        return patched
-
-    and patch_catalog_yaml writes nothing at all when patched is false - no
-    catalog, no channels, no push-pipeline update.  An early-gate bundle has the
-    same CSV name as the release bundle it was built from (rhods-operator.3.5.1 on
-    the current gap-poc content), so the name is always already present, and the
-    gate would build an FBC fragment out of unchanged release content and pass.
-    Purging that name first - which __init__ does before parse_single_bundle_catalog
-    runs - makes the insert happen.  The name is read back out of the rendered
-    bundle rather than hardcoded, so it tracks whatever Block 2 actually produced.
-
-    Why -c points at the branch's own catalog.  The release workflow passes
-    main/pcc/catalog-<ocp>.yaml, a "previously published catalog" snapshot that
-    RHOAI-Build-Config keeps on main and refreshes in a preceding job.  The POC
-    fork has no pcc/ directory and no main-branch equivalent, so the base catalog
-    is the one already committed on the branch - which is also what the release
-    workflow itself does for its second, previous-release invocation
-    (-c ${OUTPUT_CATALOG_PATH}).  Reading and writing the same path is safe:
-    parse_catalog_yaml loads the whole file in __init__, long before
-    write_output_catalog opens it for writing.
-
-    No skopeo.  Upstream microdnf-installs it and runs `skopeo login -u ... -p ...`;
-    quay.io/rhoai/rhoai-task-toolset:latest ships neither skopeo nor cosign (the
-    same discovery that broke bundle-processor on find), and nothing here calls
-    skopeo - the login was only ever a way to write a container auth file.  opm
-    reads DOCKER_CONFIG directly, so the auth file is written directly, by the
-    same umask-077 Python helper bundle-processor uses.  No credential reaches a
-    command line, a process list or a `set -x` trace.
+  description: "Regenerate the OCP catalog so it carries the early-gate bundle rather than the release one"
   params:
   - name: SOURCE_ARTIFACT
     type: string
-    description: |
-      Trusted artifact holding the RHOAI-Build-Config working tree, as produced by
-      clone-build-config-repo.  Block 3 clones the repo fresh rather than reusing
-      Block 2's artifact: the FBC reads catalog/ and config/, which bundle
-      processing never touches, and a fresh clone keeps Block 3 runnable on a run
-      where Block 2's artifact has already expired.
+    description: "Trusted artifact holding the RHOAI-Build-Config working tree, as produced by clone-build-config-repo."
   - name: ociStorage
     type: string
     description: OCI storage location for the output artifact
@@ -107,67 +17,34 @@ spec:
     description: Expiration for the output OCI artifact
   - name: BUNDLE_IMAGE_URL
     type: string
-    description: |
-      Block 2's bundle image by tag, as published in the pipeline's
-      BUNDLE_IMAGE_URL result.  Only its repository part is used; the tag is
-      stripped and replaced with BUNDLE_IMAGE_DIGEST.
+    description: "Block 2's bundle image by tag, as published in the pipeline's BUNDLE_IMAGE_URL result."
   - name: BUNDLE_IMAGE_DIGEST
     type: string
-    description: |
-      Block 2's bundle digest, sha256:<64 hex>.  Required and validated: an FBC
-      fragment references its bundle by digest, and an empty value here means
-      monitor-bundle-build could not read the tag back, which must fail the gate
-      rather than silently render the template's placeholder.
+    description: "Block 2's bundle digest, sha256:<64 hex>; required and validated, since an FBC references its bundle by digest"
   - name: QUAY_TAG
     type: string
-    description: |
-      DR-F2.  Block 1's early-gate tag, passed to fbc-processor.py as
-      -v/--rhoai-version.  Required, with no default, and rejected if it looks
-      like a release tag.
+    description: "DR-F2. Block 1's early-gate tag, passed to fbc-processor.py as -v; rejected if it looks like a release tag"
   - name: BRANCH
     type: string
-    description: |
-      DR-F1.  The ephemeral branch this processing belongs to.  Like
-      bundle-processor, the RHOAI processor has no branch concept - the branch is
-      honoured by every path below pointing into a clone of it - so this is
-      carried for the record, echoed into the log, and checked to be an eg-*
-      name.  A release branch name here means the caller wired the wrong thing.
+    description: "DR-F1. The ephemeral branch this processing belongs to; checked to be an eg-* name"
   - name: OPENSHIFT_VERSION
     type: string
     default: "v4.22"
-    description: |
-      DR-F4.  Which catalog/<version>/ directory to regenerate.  One version, not
-      the four in config/build-config.yaml's supported-ocp-versions: each one is a
-      separate ~41k-line catalog render plus a separate FBC image build, and the
-      gate is proving that the bundle Block 2 produced can be catalogued at all,
-      which one version proves as well as four.  v4.22 is the newest the POC fork
-      carries, so it is also the one whose opm render path (csv-metadata, since
-      422 >= the 420 cutoff) is least exercised elsewhere.
+    description: "DR-F4. Which catalog/<version>/ directory to regenerate - one version, not all four supported ones"
   - name: OPERATOR_BUNDLE_COMPONENT_NAME
     type: string
     default: "odh-operator-bundle"
-    description: |
-      Passed as -f/--image-filter to extract-snapshot-images.  odh-operator-bundle,
-      not upstream's opendatahub-operator-bundle: it is matched with `in` against
-      the repo_mappings keys in this repo's config/build-config.yaml.
+    description: "Passed as -f/--image-filter to extract-snapshot-images."
   - name: OPERATOR_BUNDLE_IMAGE_NAME
     type: string
     default: "RELATED_IMAGE_ODH_OPERATOR_BUNDLE_IMAGE"
-    description: |
-      Key the bundle image is recorded under in snapshot_images.json.  Only read
-      for the log line that reports what the snapshot lookup would have chosen;
-      the image actually used is BUNDLE_IMAGE_URL@BUNDLE_IMAGE_DIGEST.
+    description: "Key the bundle image is recorded under in snapshot_images.json."
   - name: FBC_PUSH_PIPELINE_COMPONENT
     type: string
-    default: "rhoai-fbc-fragment-gap"
-    description: |
-      Basename of the PaC PipelineRun file the processor is pointed at, i.e.
-      .tekton/<name>-push.yaml in the build-config repo.  Like bundle-processor's
-      -y, this is supplied because the constructor dereferences it
-      unconditionally - fbc_processor.__init__ does
-      `ruyaml.load(open(self.push_pipeline_yaml_path), ...)` with no guard - so
-      omitting it aborts before any processing.  With --push-pipeline-operation
-      enable and no disable marker in the file, process_push_pipeline is a no-op.
+    # TODO(prod): confirm once the early-gate FBC .tekton file exists. The pipeline
+    # passes fbc-push-pipeline-component, so this default only applies standalone.
+    default: "rhoai-fbc-fragment-eg"
+    description: "Basename of .tekton/<name>-push.yaml in the build-config repo; supplied because __init__ opens it unconditionally"
   - name: UTILS_REPO_URL
     type: string
     default: "https://github.com/red-hat-data-services/RHOAI-Konflux-Automation.git"
@@ -175,18 +52,14 @@ spec:
   - name: UTILS_REPO_BRANCH
     type: string
     default: "main"
-    description: |
-      main, not upstream's odh.  The RHOAI fork's processors live on main and have
-      the -v/-cba interface this task is written against.
+    description: "main, not upstream's odh: the RHOAI fork's processors live there with the -v/-cba interface this task expects"
   - name: YQ_VERSION
     type: string
     default: "v4.44.3"
   - name: OPM_VERSION
     type: string
     default: "v1.47.0"
-    description: |
-      Pinned to what the release workflow uses.  opm renders the catalog, so a
-      different version is a different catalog.
+    description: "Pinned to what the release workflow uses - opm renders the catalog, so a different version is a different catalog"
   results:
   - name: SOURCE_ARTIFACT
     description: OCI artifact with the patched catalog in the build-config source
@@ -252,11 +125,7 @@ spec:
       value: $(results.bundle-name.path)
     - name: FBC_BUNDLE_IMAGE_RESULT
       value: $(results.fbc-bundle-image.path)
-    # quay_controller derives its token env var from the Quay org:
-    # re.sub(r'[^A-Za-z0-9]', '_', org).upper() + '_QUAY_API_TOKEN', and reads it
-    # with os.environ[...] - no .get, no default - so an unset variable is a
-    # KeyError before any request is made.  Both are optional secrets and both
-    # are defaulted to "" in the script below for that reason.
+    # Derived as <ORG>_QUAY_API_TOKEN and read with os.environ[...], so an unset variable is a KeyError
     - name: RHOAI_QUAY_API_TOKEN
       valueFrom:
         secretKeyRef:
@@ -269,11 +138,7 @@ spec:
           name: early-gate-secrets
           key: REDHAT_USER_WORKLOADS_QUAY_API_TOKEN
           optional: true
-    # Registry credentials for opm.  Optional: the early-gate bundle lives in
-    # quay.io/redhat-user-workloads/rhoai-tenant/rhod-operator-bundle-gap, which
-    # is public precisely so the unauthenticated lookups in this chain work, so
-    # opm needs no credential to render it.  They are wired anyway so the same
-    # task works against a private bundle repository without a code change.
+    # Registry credentials for opm; optional, since the early-gate bundle repository is public
     - name: RHOAI_QUAY_RO_USERNAME
       valueFrom:
         secretKeyRef:
@@ -341,24 +206,15 @@ spec:
           ;;
       esac
 
-      # Strip the tag, keep the repository, pin by digest.  BUNDLE_IMAGE_URL is
-      # <repo>:<tag> with no digest, so a single %:* is right; registry ports
-      # are not in play here - every repository in this chain is quay.io.
+      # Strip the tag, keep the repository, pin by digest; every repository in this chain is quay.io
       BUNDLE_IMAGE="${BUNDLE_IMAGE_URL%:*}@${BUNDLE_IMAGE_DIGEST}"
       echo "Bundle image for FBC: ${BUNDLE_IMAGE}"
 
-      # --- Quay API tokens must be defined, not necessarily populated -------
-      # See the comment on the env entries above.  quay.io answers
-      # /api/v1/.../manifest/<digest>/labels anonymously for public
-      # repositories, so an empty token is workable; an unset one is a
-      # KeyError traceback.
+      # --- Quay API tokens must be defined, not necessarily populated: see the env entries above ---
       export RHOAI_QUAY_API_TOKEN="${RHOAI_QUAY_API_TOKEN:-}"
       export REDHAT_USER_WORKLOADS_QUAY_API_TOKEN="${REDHAT_USER_WORKLOADS_QUAY_API_TOKEN:-}"
 
-      # --- Tools ------------------------------------------------------------
-      # Into /var/workdir/bin rather than /usr/local/bin: the toolset image is
-      # not guaranteed to be writable there, and this volume is already shared
-      # with the other steps of this task.
+      # --- Tools, into /var/workdir/bin: the toolset image may not be writable at /usr/local/bin ---
       os="$(uname -s | tr '[:upper:]' '[:lower:]')"
       arch="$(uname -m | sed 's/x86_64/amd64/')"
 
@@ -377,10 +233,7 @@ spec:
       echo "Installing Python dependencies..."
       pip install --default-timeout=100 -r "${UTILS}/utils/fbc-processor/requirements.txt"
 
-      # --- Registry auth for opm -------------------------------------------
-      # Written directly rather than via `skopeo login -u ... -p ...`: that puts
-      # the token in the process list and in any `set -x` trace, and the toolset
-      # image has no skopeo to run it with.  opm honours DOCKER_CONFIG.
+      # --- Registry auth for opm: written directly, so no token reaches the process list or a set -x trace ---
       AUTH_DIR=/var/workdir/.docker
       mkdir -p "${AUTH_DIR}"
       (
@@ -435,10 +288,7 @@ spec:
         exit 1
       fi
 
-      # --- DR-F3 step 1: extract-snapshot-images ----------------------------
-      # Tolerated, not required - see the task description.  Its bundle entry is
-      # overwritten below either way; what it can still usefully contribute is a
-      # refreshed catalog/catalog_build_args.map.
+      # --- DR-F3 step 1: extract-snapshot-images, tolerated rather than required ---
       echo "Running fbc-processor.py -op extract-snapshot-images"
       if python3 "${UTILS}/utils/fbc-processor/fbc-processor.py" \
            -op extract-snapshot-images \
@@ -468,11 +318,7 @@ spec:
       cat "${SEMVER_TEMPLATE}"
       echo "======================="
 
-      # --- DR-F3 step 3: render the template with opm -----------------------
-      # Two renders because the catalog format depends on the OCP version:
-      # bundle-object below 4.20, csv-metadata from 4.20 up.  The release
-      # workflow's cutoff is 417 and upstream's is 420; 420 is the one that
-      # matches what 4.20+ clusters actually consume, so it is the one used.
+      # --- DR-F3 step 3: render with opm; two catalog formats, and 420 is what 4.20+ clusters consume ---
       CSV_META_MIN_OCP_VERSION=420
       WORK_DIR=${UTILS}/utils/fbc
       mkdir -p "${WORK_DIR}"
@@ -494,9 +340,7 @@ spec:
       fi
       echo "Using ${SINGLE_BUNDLE_PATH##*/} for ${OPENSHIFT_VERSION}"
 
-      # The olm.bundle name the render produced.  See the task description: this
-      # is what has to be purged from the base catalog for patch_olm_bundles to
-      # insert anything at all.
+      # The olm.bundle name the render produced, which has to be purged from the base catalog
       BUNDLE_NAME=$(yq e -N 'select(.schema == "olm.bundle") | .name' \
         "${SINGLE_BUNDLE_PATH}" | head -1)
       if [ -z "${BUNDLE_NAME}" ]; then
@@ -505,9 +349,7 @@ spec:
       fi
       echo "Rendered olm.bundle: ${BUNDLE_NAME}"
 
-      # Sanity: the render must actually point at Block 2's digest.  opm resolves
-      # the image it was given, so a mismatch means the template edit did not
-      # take - which is the one way this task could still produce a release FBC.
+      # Sanity: the render must point at Block 2's digest, or the template edit did not take
       if ! grep -q "${BUNDLE_IMAGE_DIGEST}" "${SINGLE_BUNDLE_PATH}"; then
         echo "The rendered bundle does not reference ${BUNDLE_IMAGE_DIGEST}." >&2
         echo "The semver template edit did not take effect." >&2

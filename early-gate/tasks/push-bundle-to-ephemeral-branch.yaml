@@ -3,37 +3,7 @@ kind: Task
 metadata:
   name: push-bundle-to-ephemeral-branch
 spec:
-  description: |
-    Commits the processed bundle to the ephemeral branch, which is what triggers
-    the PaC bundle build (DR-1c, DR-1d).
-
-    This is the task that replaces the `git push origin HEAD:rhoai-X.Y` at the end
-    of process-operator-bundle.yaml.  Same effect - processed bundle content in
-    git, a build triggered off it - with the destination changed from the release
-    branch to a throwaway ref.
-
-    Three things make it structurally unable to write to a release branch:
-
-      1. It clones the ephemeral branch and pushes back to the branch it cloned.
-         There is no branch name in the push that was not in the fetch.
-      2. The eg-* name check is repeated here rather than trusted from
-         create-ephemeral-branch, because this is the task holding a write token.
-      3. There is no force flag.  process-operator-bundle.yaml has one; a
-         fast-forward onto a branch this pipeline created moments ago does not
-         need it, and its absence means a surprise on the remote fails the task
-         instead of being overwritten.
-
-    Cloning fresh rather than reusing the .git directory inside the trusted
-    artifact is deliberate: it makes the task independent of whether the artifact
-    carried git metadata, and it means the commit is built on the ephemeral
-    branch's real head rather than on a detached release-branch checkout that
-    merely happens to have the same tree.
-
-    The commit is made with --allow-empty and an "early-gate:" subject.  A gate
-    whose components all happen to match the release digests still has to produce
-    a bundle build - "nothing changed" is a valid gate result, not a reason to
-    skip the build - and the subject line is what the PaC CEL matches on when
-    there is no file diff to match instead.
+  description: "Commits the processed bundle to the ephemeral branch, which is what triggers the PaC bundle build (DR-1c, DR-1d)."
   params:
   - name: SOURCE_ARTIFACT
     type: string
@@ -47,17 +17,11 @@ spec:
   - name: commit-message
     type: string
     default: "early-gate: pin bundle to gated component digests"
-    description: |
-      Commit subject. Must start with "early-gate:" - the PaC CEL on the bundle
-      PipelineRun matches on it so that an empty commit still triggers a build.
+    description: "Commit subject."
   - name: paths
     type: string
     default: "bundle config"
-    description: |
-      Space-separated paths, relative to the repo root, to copy out of the
-      artifact and commit.  Narrow on purpose: the processor only writes under
-      bundle/ and config/, and anything else appearing in the diff would mean
-      something went wrong.
+    description: "Space-separated paths, relative to the repo root, to copy out of the artifact and commit."
   results:
   - name: commit-sha
     description: The commit pushed to the ephemeral branch
@@ -113,8 +77,7 @@ spec:
           ;;
       esac
 
-      # Credentials go in a file, never on a command line or in a remote URL, so
-      # they cannot surface in `ps`, in git's own error output, or in a task log.
+      # Credentials go in a file, never on a command line or in a remote URL
       TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
       export HOME=/var/workdir
       git config --global credential.helper 'store --file=/var/workdir/.git-credentials'
@@ -127,13 +90,7 @@ spec:
       PUSH_DIR=/var/workdir/push
       git clone --depth 1 --branch "${BRANCH}" "https://github.com/${REPO}.git" "${PUSH_DIR}"
 
-      # Copy the processed paths over the ephemeral branch checkout.  Each path is
-      # removed first so a manifest the processor dropped does not survive as a
-      # stale file in the commit.
-      #
-      # ADD_PATHS accumulates only the paths that exist afterwards: `git add -- X`
-      # on a pathspec that matches nothing is a fatal error, which would turn a
-      # harmless "this branch has no config/ directory" into a failed gate.
+      # Each path is removed first so a dropped manifest does not survive; ADD_PATHS keeps git add off an empty pathspec
       ADD_PATHS=()
       for p in ${PATHS}; do
         if [ -e "/var/workdir/source/${p}" ]; then
@@ -167,8 +124,7 @@ spec:
       echo "Pushing ${SHA} to ${REPO} ${BRANCH}"
       git push origin "HEAD:${BRANCH}"
 
-      # The credentials file lives on an emptyDir shared with later steps in this
-      # task only, but there is no reason for it to outlive the push.
+      # No reason for the credentials file to outlive the push
       rm -f /var/workdir/.git-credentials
 
       echo -n "${SHA}"    > "$(results.commit-sha.path)"

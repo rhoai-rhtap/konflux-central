@@ -3,66 +3,23 @@ kind: Task
 metadata:
   name: verify-fbc-images
 spec:
-  description: |
-    Asserts that the regenerated catalog carries the early-gate bundle and not a
-    release one (DR-F6).  This is Block 3's equivalent of verify-bundle-images:
-    the difference between "an FBC fragment rendered" and "an FBC fragment
-    rendered around the bundle the gate just built".
-
-    What it checks, all against catalog/<ocp>/rhods-operator/catalog.yaml as it
-    stands after fbc-processor:
-
-      1. The olm.bundle entry named BUNDLE_NAME exists.  Its absence is the
-         silent-no-op failure: patch_olm_bundles writes nothing when the name is
-         already present, so a catalog that was never touched still parses, still
-         builds, and still passes a weaker check.
-      2. That entry's `image` is exactly BUNDLE_IMAGE - Block 2's bundle pinned by
-         digest.  Not the same repository, not the same tag: the same digest.
-      3. Every image reference inside that entry - the bundle image itself and
-         every relatedImages entry - is pinned by digest and carries no release
-         tag (rhoai-X.Y, odh-stable, latest, stable, *-nightly, and the release
-         branch this run forked from, by name).
-      4. Block 1's operator image appears among that entry's relatedImages at the
-         gated digest.  This is the end-to-end assertion: Block 1's digest, routed
-         through Block 2's bundle, visible in Block 3's catalog.
-      5. Some olm.channel entry references BUNDLE_NAME.  An olm.bundle no channel
-         points at is unreachable, and purge_unused_olm_bundles would delete it on
-         the next pass.
-
-    Scope is deliberately the new bundle entry, not the whole catalog.  The file
-    holds eighty-odd previously shipped bundles whose images are release content
-    pinned at registry.redhat.io - that is what a catalog is.  Failing on those
-    would fail every possible run.  They are counted and reported so the split is
-    visible in the log, the same way verify-bundle-images reports ungated
-    components.
-
-    catalog_build_args.map is scanned advisory-only.  It feeds the FBC image's
-    git.url/git.commit LABELs and nothing else; fbc-processor already explains why
-    an early-gate run usually leaves it at whatever the branch carried.
+  description: "Asserts that the regenerated catalog carries the early-gate bundle and not a release one (DR-F6)."
   params:
   - name: SOURCE_ARTIFACT
     type: string
     description: Trusted artifact holding the processed build-config working tree
   - name: CATALOG_PATH
     type: string
-    description: |
-      Repo-relative path of the regenerated catalog, as produced by
-      fbc-processor's catalog-path result.
+    description: "Repo-relative path of the regenerated catalog, as produced by fbc-processor's catalog-path result."
   - name: BUNDLE_NAME
     type: string
-    description: |
-      olm.bundle name to check, as produced by fbc-processor's bundle-name
-      result, e.g. rhods-operator.3.5.1.
+    description: "olm.bundle name to check, as produced by fbc-processor's bundle-name result, e.g. rhods-operator.3.5.1."
   - name: BUNDLE_IMAGE
     type: string
-    description: |
-      Block 2's bundle pinned by digest, as produced by fbc-processor's
-      fbc-bundle-image result.
+    description: "Block 2's bundle pinned by digest, as produced by fbc-processor's fbc-bundle-image result."
   - name: OPERATOR_IMAGE
     type: string
-    description: |
-      Block 1's operator image by digest.  Empty disables check 4 with a report
-      rather than failing, for a run that is exercising Block 3 alone.
+    description: "Block 1's operator image by digest."
     default: ""
   - name: RELEASE_BRANCH
     type: string
@@ -115,15 +72,7 @@ spec:
       import sys
       from pathlib import Path
 
-      # Standard library only.  quay.io/rhoai/rhoai-task-toolset is a minimal
-      # image: it has python3 but no PyYAML, and `import yaml` aborted this task
-      # in 13 seconds before a single check ran.  verify-bundle-images.yaml, which
-      # runs green on the same image, is stdlib-only for the same reason.
-      #
-      # Nothing of value is lost.  The catalog was already being scanned with
-      # regex - splitting ~100 documents and matching schema/name - and the two
-      # fields this task reads out of the one matched document, `image` and
-      # `relatedImages`, are flat scalars in opm-rendered output.
+      # Standard library only: the toolset image has python3 but no PyYAML
 
       SOURCE = Path("/var/workdir/source")
       CATALOG = SOURCE / os.environ["CATALOG_PATH"].strip()
@@ -134,14 +83,7 @@ spec:
       OPERATOR_IMAGE = os.environ.get("OPERATOR_IMAGE", "").strip()
       RELEASE_BRANCH = os.environ.get("RELEASE_BRANCH", "").strip()
 
-      # Tags that mean "this came from the release, not from the gate".  The
-      # branch we forked from is included by name, so a gate against rhoai-3.7
-      # rejects rhoai-3.7 even if the generic pattern is ever loosened.
-      #
-      # odh-pr/odh-pr-<N> is the odd one out: it is not a release tag, it is
-      # upstream ODH's per-PR tag.  Rejected all the same, because the thing
-      # being verified is that every operand the gate ships came from this
-      # gate run, and an ODH PR image is no more that than a released one is.
+      # Tags meaning "from the release, not the gate". odh-pr is upstream ODH's per-PR tag, rejected all the same
       FORBIDDEN_TAGS = {t for t in (RELEASE_BRANCH, "odh-stable", "latest", "stable") if t}
       FORBIDDEN_TAG_RE = re.compile(
           r"^(?:rhoai-\d+\.\d+(?:[.-].*)?|odh-stable|odh-pr(?:-.*)?"
@@ -181,8 +123,7 @@ spec:
           for line in doc[header.end():].splitlines()[1:]:
               if not line.strip():
                   continue
-              # A column-0 character that is not the sequence dash is the next
-              # top-level key, e.g. the trailing `schema: olm.bundle`.
+              # A column-0 character that is not the sequence dash is the next top-level key
               if not line[0].isspace() and not line.startswith("-"):
                   break
               item = re.match(r"^-[ \t]+([A-Za-z0-9_.-]+):[ \t]*(.*)$", line)
@@ -202,10 +143,7 @@ spec:
           Path(os.environ["VERIFIED_RESULT"]).write_text("false")
           sys.exit(1)
 
-      # The catalog is tens of thousands of lines across ~100 documents.  Only the
-      # one document this gate added needs parsing, so the file is split on the
-      # document separator and the rest are only counted.  yaml.safe_load_all over
-      # the whole thing would work and would be slower for no gain.
+      # Only the document this gate added needs parsing, so the file is split and the rest are counted
       raw = CATALOG.read_text()
       documents = re.split(r"(?m)^---\s*$", raw)
 
@@ -292,8 +230,7 @@ spec:
           if OPERATOR_IMAGE in (ref for _, ref in refs):
               print(f"OK  operator image present in the catalog bundle: {OPERATOR_IMAGE}")
           elif hit:
-              # Digest matches but the path does not: build-config.yaml's
-              # registry/repo replacement rewrote it on the way in.  Same image.
+              # Digest matches but the path does not: build-config.yaml's registry/repo replacement. Same image.
               print(f"OK  operator digest present under a replaced path: {hit}")
           else:
               failures.append(

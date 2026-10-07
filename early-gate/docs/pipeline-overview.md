@@ -112,9 +112,15 @@ Tekton in whatever cluster the build landed in.
 
 | Block | PaC file | Fires on |
 |---|---|---|
-| 1 | `rhods-operator-gap/.tekton/rhods-operator-gap-eg-push.yaml` | push to `eg-*` |
-| 2 | `RHOAI-Build-Config-gap/.tekton/rhod-operator-bundle-gap-push.yaml` | push to `eg-bundle-*` |
-| 3 | `RHOAI-Build-Config-gap/.tekton/rhoai-fbc-fragment-gap-push.yaml` | push to `eg-fbc-*` |
+| 1 | `rhods-operator/.tekton/odh-operator-eg-push.yaml` | push to `eg-*` |
+| 2 | `RHOAI-Build-Config/.tekton/odh-operator-bundle-eg-push.yaml` | push to `eg-bundle-*` |
+| 3 | `RHOAI-Build-Config/.tekton/rhoai-fbc-fragment-eg-push.yaml` | push to `eg-fbc-*` |
+
+> **TODO(prod):** none of these three files, nor the Konflux Components behind them,
+> exist in `red-hat-data-services` yet. The names above are what the pipeline params
+> currently expect; confirm them when the Components are created. Each must be a
+> *dedicated early-gate* Component pushing to `quay.io/rhoai/pull-request-pipelines` —
+> never the release Component, which pushes to a release repository.
 
 Each EG arm matches on **branch prefix plus an `early-gate:` commit subject** — Block 1
 also accepts a changed `build/operands-map.yaml`, since that is what its processor writes:
@@ -160,7 +166,7 @@ a command line, never in a remote URL.
 | Secret | Used for |
 |---|---|
 | `eg-github-token` | Branch operations and the workflow dispatch (needs `actions:write`, which the PaC token does not carry) |
-| `rhoai-quay-gap-ro` | Reading digests from the private `quay.io/rhoai` |
+| `rhoai-quay-gap-ro` | Reading digests from the private `quay.io/rhoai` — TODO(prod): POC secret name; confirm or rename when the production secret is created |
 
 Registry auth is written to a file by a stdlib-only Python helper under `umask 077`,
 rather than `skopeo login -p` / `cosign login -p`, so no secret ever reaches the process
