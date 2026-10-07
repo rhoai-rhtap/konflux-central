@@ -35,6 +35,28 @@ spec:
     description: Skip checks against built image
     name: skip-checks
     type: string
+  - default: "false"
+    description: |
+      Skip fbc-fips-check-oci-ta only, leaving every other check running.
+
+      Not a variant of skip-checks: that one is all-or-nothing, and the
+      thing it switches off first is validate-fbc, which is the only task
+      in the chain that checks opm schema and graph validity.  Needing to
+      drop the FIPS scan should not cost that.
+
+      The FIPS task scans every relatedImage the fragment references -
+      hundreds of them - and is the pipeline's longest task by a wide
+      margin, carrying its own timeout: 6h for the purpose.  That is
+      proportionate for a release build, where the scan is the deliverable.
+      It is not proportionate for the early gate, which is asking whether a
+      proposed catalog is structurally valid and references the digests it
+      should: the FIPS posture of already-released operand images is not
+      something a gate run can change, and scanning them again makes the
+      gate's slowest leg slower than the gate's own budget.
+
+      Leave it "false" for release builds.
+    name: skip-fips-check
+    type: string
   - default: "true"
     description: Execute the build with network isolation
     name: hermetic
@@ -388,8 +410,15 @@ spec:
       - name: kind
         value: task
       resolver: bundles
+    # Two guards, both of which must pass.  Tekton ANDs when clauses, so
+    # skip-checks still switches this off with everything else, and
+    # skip-fips-check switches off this task alone.
     when:
     - input: $(params.skip-checks)
+      operator: in
+      values:
+      - "false"
+    - input: $(params.skip-fips-check)
       operator: in
       values:
       - "false"
