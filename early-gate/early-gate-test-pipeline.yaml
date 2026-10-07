@@ -303,12 +303,21 @@ spec:
   # --------------------------------------------------------------------------
   # 3a. Watch a job this run started
   # --------------------------------------------------------------------------
-  # Four hours. The smoke suite installs an operator and exercises it; the
+  # Six hours. The smoke suite installs an operator and exercises it; the
   # monitor's own polling is coarse because every status check costs a GitHub
   # Actions runner start, so the budget has to cover the suite plus the
   # granularity of noticing it has finished.
+  #
+  # Six rather than four for the same reason the build blocks' monitors were
+  # raised, with one aggravation: this task takes no timeout param, so the
+  # Tekton task timeout is the entire budget and there is nothing inside the
+  # task that notices it is about to run out. When it expires the gate
+  # reports a smoke test that never finished while the Jenkins job is still
+  # running and still holding a cluster. Unlike a build there is no declared
+  # ceiling to size against - how long the suite takes is a property of the
+  # suite - so the number is deliberately loose.
   - name: monitor-fresh
-    timeout: 4h
+    timeout: 6h
     runAfter:
     - trigger-test-pipeline
     when:
@@ -381,7 +390,7 @@ spec:
   # skipped on this path. The job URL is already known, so the monitor's
   # phase A is skipped too.
   - name: monitor-resume
-    timeout: 4h
+    timeout: 6h
     runAfter:
     - check-ongoing-jobs
     when:
