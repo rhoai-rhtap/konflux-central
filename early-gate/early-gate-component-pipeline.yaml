@@ -357,42 +357,71 @@ spec:
       anything other than a test run of an unmerged branch.
 
   # --- Timeouts ---
+  #
+  # All four were raised together.  The common reason is that the gate is
+  # being run at one architecture while it is being brought up and will be
+  # run at four in production, and a timeout that fits the fast configuration
+  # is a timeout that has to be revisited at exactly the moment the pipeline
+  # is least convenient to change.  These are sized for the slow case now, so
+  # restoring the full platform matrix is a change to the push files alone.
+  #
+  # A monitor expiring before the build it watches is the worst failure the
+  # gate has: cleanup-ephemeral-branch then deletes the branch out from under
+  # a build that was still legitimately running, so the evidence of what went
+  # wrong is destroyed along with it.  Overshooting costs wall-clock on a run
+  # that was going to fail anyway.  The budgets are asymmetric on purpose.
   - name: processor-timeout-minutes
     type: string
-    default: "20"
+    default: "30"
+    description: |
+      The processor is a GitHub Actions workflow, so this covers queueing for
+      a runner as well as the work itself - and a busy org queues.
   - name: build-timeout-minutes
     type: string
-    default: "150"
+    default: "270"
     description: |
       Must outlast the build it watches, not merely be a long-looking number.
-      The operator's EG build is the 4-arch hermetic one - x86_64, ppc64le,
-      s390x and arm64 through multi-arch-container-build.yaml, with a cachi2
-      prefetch - and .tekton/rhods-operator-gap-eg-push.yaml gives itself
-      timeouts.pipeline: 4h.  At 90 this task gave up at 13:33Z on a build
-      that had started at 12:01Z and was still legitimately running, and then
+      The operator's EG build is the hermetic one with a cachi2 prefetch,
+      through multi-arch-container-build.yaml, and
+      .tekton/rhods-operator-gap-eg-push.yaml gives itself timeouts.pipeline:
+      4h.  At 90 this task gave up at 13:33Z on a build that had started at
+      12:01Z and was still legitimately running, and then
       cleanup-ephemeral-branch deleted the branch out from under it.  A warm
       cache can finish the same build in eight minutes, which is what made 90
       look sufficient; a cold one does not.
 
-      150 rather than 240 because the launcher's own budget has to cover this
-      plus everything after it.  See the arithmetic on timeouts.pipeline in
-      .tekton/rhods-operator-gap-eg-build.yaml.
+      270 = that 4h ceiling plus 30 minutes.  The invariant is what sets the
+      number: this task has to survive long enough to observe the build hit
+      its own timeout and report that, rather than give up first and leave
+      the gate blaming the monitor for a build failure.  The previous 150 was
+      chosen to fit a 6h launcher budget; the launcher budget moved instead.
+
+      The build currently runs x86_64 only (see build-platforms in the push
+      file).  This number assumes it will not.
   - name: bundle-build-timeout-minutes
-    type: string
-    default: "60"
-    description: |
-      Shorter than the operator's.  The bundle is FROM scratch with no compile
-      step and no multi-arch fan-out, so an hour is generous; a bundle build
-      still running after that is stuck, not slow.
-  - name: fbc-build-timeout-minutes
     type: string
     default: "90"
     description: |
-      Longer than the bundle's.  An FBC fragment is single-arch and has no
-      compile step either, but it does pull a ~1GB
+      Shorter than the operator's.  The bundle is FROM scratch with no compile
+      step and no multi-arch fan-out, so this is generous; a bundle build
+      still running after it is stuck, not slow.  Raised from 60 for headroom
+      against a cold cluster, not against any observed overrun.
+  - name: fbc-build-timeout-minutes
+    type: string
+    default: "150"
+    description: |
+      Longer than the bundle's.  An FBC fragment has no compile step either,
+      but it does pull a ~1GB
       registry.redhat.io/openshift4/ose-operator-registry-rhel9 base and run
-      `opm serve --cache-only` over a catalog with eighty-odd bundles in it, and
-      it queues behind everything else the gate has already started.
+      `opm serve --cache-only` over a catalog with eighty-odd bundles in it,
+      and it queues behind everything else the gate has already started.
+
+      Raised from 90 for the platform matrix specifically.  An FBC fragment
+      is per architecture - a catalog pins image references, and a reference
+      that resolves on x86_64 is not evidence it resolves on s390x - so the
+      release build genuinely fans out, and the base pull happens once per
+      platform.  The gate builds x86_64 alone for now; this number is sized
+      for when it does not.
 
   results:
   - name: EG_BRANCH
