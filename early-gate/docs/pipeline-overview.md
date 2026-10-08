@@ -45,8 +45,8 @@ and ship another. Two consequences fall out of that:
 | Task | What it does |
 |---|---|
 | `resolve-group-configuration` | Reads the leader PR, collects its child component PRs, decides which release branch to fork from |
-| `generate-snapshot` | Resolves every component's current image digest from Quay into one Snapshot |
-| `audit-snapshot` | Sanity-checks it and records which components were omitted |
+| `generate-snapshot` | Resolves every component's digest from Quay into one Snapshot, preferring its PR build over the release image, and records which components fell back |
+| `audit-snapshot` | Logs the resolved image, commit and repo for every component. Validates nothing, and its results are currently unconsumed |
 
 ### Block 1 — Operator
 
@@ -112,7 +112,7 @@ Tekton in whatever cluster the build landed in.
 
 | Block | PaC file | Fires on |
 |---|---|---|
-| 1 | `rhods-operator/.tekton/odh-operator-eg-push.yaml` | push to `eg-*` |
+| 1 | `rhods-operator/.tekton/rhods-operator-eg-push.yaml` | push to `eg-*` |
 | 2 | `RHOAI-Build-Config/.tekton/odh-operator-bundle-eg-push.yaml` | push to `eg-bundle-*` |
 | 3 | `RHOAI-Build-Config/.tekton/rhoai-fbc-fragment-eg-push.yaml` | push to `eg-fbc-*` |
 
