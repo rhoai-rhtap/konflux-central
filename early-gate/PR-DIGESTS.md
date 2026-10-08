@@ -1,15 +1,26 @@
 # PR-specific digests in the early gate
 
 **Status: option A (by commit) is implemented.** `generate-snapshot-for-group-testing`
-now probes, in order:
+makes one probe and falls back:
 
-1. `quay.io/<quay_path>:rhoai-pr-<N>` — the component's own repository, ODH-style
-2. `quay.io/rhoai/pull-request-pipelines:<component>-<commit>` — what RHOAI actually publishes
-3. `quay.io/<quay_path>:rhoai-3.5` — the release fallback
+1. `quay.io/rhoai/pull-request-pipelines:<component>-<commit>` — what RHOAI actually publishes
+2. `quay.io/<quay_path>:rhoai-3.5` — the release fallback, recorded as `fallback`
 
-Probe 2 is the one that hits on RHOAI. It needs the head SHA of each child PR,
-which `resolve-group-configuration` reads from the GitHub API while it is
-already walking the child PR list and carries in each component's `sha` field.
+The probe needs the head SHA of each child PR, which `resolve-group-configuration`
+reads from the GitHub API while it is already walking the child PR list and
+carries in each component's `sha` field. A PR number cannot locate the image,
+because the shared repository keys its tags on the commit.
+
+An own-repository probe at `quay.io/<quay_path>:rhoai-pr-<N>` used to run ahead
+of it. That spelling is an ODH convention and no RHOAI component publishes it,
+so it was one authenticated `skopeo inspect` per component per run that could
+not succeed. It is gone — removed rather than kept "in case", because a probe
+that cannot succeed is indistinguishable in the log from one that merely failed,
+which is how its uselessness went unnoticed for so long. The reasoning is
+repeated at the removal site in the task.
+
+> Read the rest of this note with that in mind: where it refers to three probes,
+> there are now two, and the numbering below predates the removal.
 
 The rest of this note is the measurement that led there, kept because it also
 explains why the other options were rejected.

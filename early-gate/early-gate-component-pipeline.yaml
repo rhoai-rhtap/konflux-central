@@ -629,11 +629,14 @@ spec:
         value: early-gate/tasks/resolve-group-configuration.yaml
 
   # Resolves each of those components to a concrete quay digest and stores the
-  # result as a trusted artifact.  Three probes, in order: the component's own
-  # repository tagged rhoai-pr-<N>, then the shared
-  # quay.io/rhoai/pull-request-pipelines repository tagged
-  # <component>-<commit>, then the release tag.  The middle one is what RHOAI
-  # PR pipelines actually publish; see early-gate/PR-DIGESTS.md.
+  # result as a trusted artifact.  One probe and a fallback: the shared
+  # quay.io/rhoai/pull-request-pipelines repository tagged <component>-<commit>,
+  # which is what RHOAI PR pipelines publish, then the release tag.
+  #
+  # An own-repository probe tagged rhoai-pr-<N> used to run ahead of it.  That
+  # is an ODH convention no RHOAI component publishes, so it could never hit;
+  # it was removed.  The task documents why at the removal site, and
+  # early-gate/PR-DIGESTS.md has the measurements.
   - name: generate-snapshot
     runAfter:
     - resolve-group-configuration
