@@ -294,7 +294,7 @@ spec:
       - name: pathInRepo
         value: early-gate/tasks/resolve-group-configuration.yaml
 
-  # Resolves each component to a digest: rhoai-pr-<N>, then <component>-<commit>, then the release tag
+  # Resolves each component to a digest: one probe against the shared pull-request-pipelines repo tagged <component>-<commit>, then the release tag. An own-repository probe at rhoai-pr-<N> used to run first - an ODH convention no RHOAI component publishes, so it could never hit - and was removed; the task records why at the removal site
   - name: generate-snapshot
     runAfter:
     - resolve-group-configuration
