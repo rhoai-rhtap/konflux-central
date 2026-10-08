@@ -494,7 +494,7 @@ spec:
           if [ "${state}" = "ready" ]; then
             STATUS_TEXT="PR build ready"
           else
-            STATUS_TEXT="Using stable"
+            STATUS_TEXT="Using release"
           fi
 
           echo "| ${PR_LINK} | $(cell "${comp}") | \`$(cell "${tag}")\` | ${STATUS_TEXT} | \`$(cell "${digest}")\` |" >> "${BODY}"

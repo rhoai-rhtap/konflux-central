@@ -196,6 +196,13 @@ spec:
     description: |
       Name of the PaC check-run to watch.  Must match the PipelineRun name in
       rhods-operator-gap-eg-push.yaml, since that is what PaC reports as.
+  - name: operator-push-pipeline-path
+    type: string
+    default: ".tekton/rhods-operator-gap-eg-push.yaml"
+    description: |
+      PaC file on the operator's ephemeral branch whose output-image tag is
+      pinned before operator-processor is dispatched.  Must be the early-gate
+      file, never the release one.
 
   # --- Bundle build (Block 2) ---
   - name: build-config-repo
@@ -251,6 +258,14 @@ spec:
       PipelineRun name in the build-config repo's
       .tekton/rhod-operator-bundle-gap-push.yaml, since that is what PaC
       reports as.
+  - name: bundle-push-pipeline-path
+    type: string
+    default: ".tekton/rhod-operator-bundle-gap-push.yaml"
+    description: |
+      PaC file on the bundle's ephemeral branch whose output-image tag is
+      pinned before the bundle commit.  Names the same file as
+      bundle-processor's PUSH_PIPELINE_PATH: the processor takes a scratch copy
+      of it, this rewrites the real one on the branch.
   - name: bundle-verify-strict
     type: string
     default: "false"
@@ -901,6 +916,10 @@ spec:
       value: $(params.leader-pr-number)
     - name: rhoai-version
       value: $(params.rhoai-version)
+    - name: push-pipeline-path
+      value: $(params.operator-push-pipeline-path)
+    - name: output-image
+      value: $(params.operator-output-image):odh-operator-eg-$(params.leader-pr-number)
     workspaces:
     - name: github-credentials
       workspace: github-credentials
@@ -915,6 +934,12 @@ spec:
       - name: rhoai-version
         type: string
         default: ""
+      - name: push-pipeline-path
+        type: string
+        default: ""
+      - name: output-image
+        type: string
+        default: ""
       results:
       - name: previous-run-id
         description: |
@@ -925,6 +950,92 @@ spec:
       - name: github-credentials
         description: Secret workspace holding a 'token' key
       steps:
+      # Block 1 has no gate task between forking the branch and the build,
+      # because operator-processor makes the commit PaC builds.  So the tag is
+      # pinned here, ahead of the dispatch, and the processor's commit inherits
+      # it.
+      #
+      # This commit must not itself start a build.  The operator CEL fires on
+      # "build/operands-map.yaml".pathChanged() or an "early-gate:" subject;
+      # this touches only the .tekton file and is deliberately subjected
+      # "chore(...)", so it matches neither arm.  Changing either the CEL or
+      # this subject without the other turns a silent no-op into a build of an
+      # unprocessed branch.
+      - name: pin-output-image
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        env:
+        - name: REPO
+          value: $(params.repo)
+        - name: BRANCH
+          value: $(params.branch-name)
+        - name: PUSH_PIPELINE_PATH
+          value: $(params.push-pipeline-path)
+        - name: OUTPUT_IMAGE
+          value: $(params.output-image)
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+
+          if [ -z "${PUSH_PIPELINE_PATH}" ] || [ -z "${OUTPUT_IMAGE}" ]; then
+            echo "No push-pipeline-path or output-image given; leaving the branch's PaC file alone."
+            exit 0
+          fi
+
+          # Repeated here rather than trusted from create-ephemeral-branch,
+          # because this is a step holding a write token
+          case "${BRANCH}" in
+            eg-*) ;;
+            *)
+              echo "Refusing to write to '${BRANCH}': only eg-* branches (DR-1)." >&2
+              exit 1
+              ;;
+          esac
+
+          microdnf install -y git >/dev/null
+
+          # Credentials go in a file, never on a command line or in a remote URL
+          TOKEN=$(cat "$(workspaces.github-credentials.path)/token")
+          export HOME=/tmp
+          git config --global credential.helper 'store --file=/tmp/.git-credentials'
+          ( umask 077; printf 'https://x-access-token:%s@github.com\n' "${TOKEN}" > /tmp/.git-credentials )
+          unset TOKEN
+          git config --global user.name  "rhoai-early-gate[bot]"
+          git config --global user.email "rhoai-early-gate@users.noreply.github.com"
+
+          PIN_DIR=/tmp/pin
+          git clone --depth 1 --branch "${BRANCH}" "https://github.com/${REPO}.git" "${PIN_DIR}"
+
+          TEKTON_FILE="${PIN_DIR}/${PUSH_PIPELINE_PATH}"
+          if [ ! -f "${TEKTON_FILE}" ]; then
+            echo "push-pipeline-path '${PUSH_PIPELINE_PATH}' is not on ${BRANCH}." >&2
+            echo "Without it the build publishes the templated tag, which" >&2
+            echo "monitor-operator-build does not look for, so the gate would" >&2
+            echo "wait out its budget on an image under another name." >&2
+            exit 1
+          fi
+
+          # Rewrite the value line that follows '- name: output-image', so that
+          # a mention of output-image in a comment is not rewritten with it
+          sed -i -E '/^[[:space:]]*-[[:space:]]+name:[[:space:]]*output-image[[:space:]]*$/{n;s|^([[:space:]]*value:[[:space:]]*).*$|\1'"${OUTPUT_IMAGE}"'|}' "${TEKTON_FILE}"
+          if ! grep -qF "value: ${OUTPUT_IMAGE}" "${TEKTON_FILE}"; then
+            echo "Could not pin output-image to '${OUTPUT_IMAGE}' in ${PUSH_PIPELINE_PATH}." >&2
+            echo "The file's output-image param is not in the shape this sed expects." >&2
+            exit 1
+          fi
+
+          cd "${PIN_DIR}"
+          git add -- "${PUSH_PIPELINE_PATH}"
+          if git diff --cached --quiet; then
+            echo "Already pinned to ${OUTPUT_IMAGE}; nothing to push."
+          else
+            git commit -m "chore(early-gate): pin the output image tag for this run"
+            git push origin "HEAD:${BRANCH}"
+            echo "Pinned output-image to ${OUTPUT_IMAGE} on ${BRANCH}"
+          fi
+
+          # No reason for the credentials file to outlive the push
+          rm -f /tmp/.git-credentials
+
       - name: dispatch
         image: registry.access.redhat.com/ubi9/ubi-minimal:latest
         script: |
@@ -1178,7 +1289,7 @@ spec:
     # only one of the three not matching prod: Block 2 already uses
     # odh-operator-bundle and Block 3 rhoai-fbc-fragment.
     - name: image-tag
-      value: odh-operator-$(tasks.fork-operator-branch.results.branch-name)-$(tasks.monitor-operator-processor.results.processor-commit)
+      value: odh-operator-eg-$(params.leader-pr-number)
     - name: timeout-minutes
       value: $(params.build-timeout-minutes)
     workspaces:
@@ -1496,7 +1607,7 @@ spec:
     - name: source-sha
       value: $(tasks.clone-build-config.results.release-sha)
     - name: branch-name
-      value: eg-bundle-$(context.pipelineRun.uid)
+      value: eg-bundle-$(params.leader-pr-number)-$(context.pipelineRun.uid)
     workspaces:
     - name: github-credentials
       workspace: github-credentials
@@ -1624,6 +1735,10 @@ spec:
       value: $(tasks.fork-bundle-branch.results.branch-name)
     - name: commit-message
       value: "early-gate: pin bundle to gated digests for PR $(params.leader-pr-number)"
+    - name: push-pipeline-path
+      value: $(params.bundle-push-pipeline-path)
+    - name: output-image
+      value: $(params.bundle-output-image):odh-operator-bundle-eg-$(params.leader-pr-number)
     workspaces:
     - name: github-credentials
       workspace: github-credentials
@@ -1655,7 +1770,7 @@ spec:
     # reconstructed.  Must stay equal to output-image in the build-config
     # repo's .tekton/rhod-operator-bundle-gap-push.yaml.
     - name: image-tag
-      value: odh-operator-bundle-$(tasks.fork-bundle-branch.results.branch-name)-$(tasks.push-bundle-to-ephemeral-branch.results.commit-sha)
+      value: odh-operator-bundle-eg-$(params.leader-pr-number)
     - name: timeout-minutes
       value: $(params.bundle-build-timeout-minutes)
     workspaces:
@@ -1702,7 +1817,7 @@ spec:
     - name: source-sha
       value: $(tasks.clone-build-config.results.release-sha)
     - name: branch-name
-      value: eg-fbc-$(context.pipelineRun.uid)
+      value: eg-fbc-$(params.leader-pr-number)-$(context.pipelineRun.uid)
     workspaces:
     - name: github-credentials
       workspace: github-credentials
@@ -1817,6 +1932,10 @@ spec:
       value: "catalog"
     - name: commit-message
       value: "early-gate: catalog $(tasks.fbc-processor.results.bundle-name) at gated bundle digest for PR $(params.leader-pr-number)"
+    - name: push-pipeline-path
+      value: .tekton/$(params.fbc-push-pipeline-component)-push.yaml
+    - name: output-image
+      value: $(params.fbc-output-image):rhoai-fbc-fragment-eg-$(params.leader-pr-number)
     workspaces:
     - name: github-credentials
       workspace: github-credentials
@@ -1852,7 +1971,7 @@ spec:
     # per-platform manifests buildah pushes alongside it carry a
     # -linux-<arch> suffix and are not what require-digest below resolves.
     - name: image-tag
-      value: rhoai-fbc-fragment-$(tasks.fork-fbc-branch.results.branch-name)-$(tasks.push-fbc-to-ephemeral-branch.results.commit-sha)
+      value: rhoai-fbc-fragment-eg-$(params.leader-pr-number)
     - name: timeout-minutes
       value: $(params.fbc-build-timeout-minutes)
     # DR-F7.  Block 3 is the end of the chain, so FBC_IMAGE_DIGEST and
@@ -2119,7 +2238,7 @@ spec:
     - name: repo
       value: $(params.build-config-repo)
     - name: branch-name
-      value: eg-bundle-$(context.pipelineRun.uid)
+      value: eg-bundle-$(params.leader-pr-number)-$(context.pipelineRun.uid)
     - name: defer-cleanup
       value: $(params.defer-bundle-branch-cleanup)
     workspaces:
@@ -2152,7 +2271,7 @@ spec:
     - name: repo
       value: $(params.build-config-repo)
     - name: branch-name
-      value: eg-fbc-$(context.pipelineRun.uid)
+      value: eg-fbc-$(params.leader-pr-number)-$(context.pipelineRun.uid)
     - name: defer-cleanup
       value: $(params.defer-fbc-branch-cleanup)
     workspaces:
