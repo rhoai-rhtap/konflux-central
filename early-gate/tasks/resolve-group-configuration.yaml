@@ -1,0 +1,649 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: resolve-group-configuration
+spec:
+  description: |
+    RHOAI adaptation of opendatahub-io/odh-konflux-central's
+    early-gate/tasks/resolve-group-configuration.yaml.
+
+    The logic is unchanged.  What differs is the org it trusts
+    (rhoai-rhtap instead of opendatahub-io) and the component map it reads
+    (rhoai-rhtap/konflux-central config/component_repo_map.json).
+
+    One addition: the upstream task is always invoked from a PaC-triggered
+    PipelineRun, so it can read the PR it is resolving straight off the
+    pipelinesascode.tekton.dev labels.  The RHOAI early-gate pipeline is
+    driven by the Leader PR Manager instead, which hands the leader PR in as
+    parameters, so leader-pr-repo/leader-pr-number are accepted and take
+    precedence when set.  With both unset the task behaves exactly as
+    upstream does.
+
+    A second addition, RHOAI-only: this task is now the pipeline's single
+    entry point.  It used to run alongside a separate check-leader-pr task
+    that read the same leader PR a second time purely to decide which branch
+    the ephemeral branch forks from.  That decision now lives here, as the
+    source-branch result, so the leader PR is parsed once.
+
+    Because fork-operator-branch depends on that result, this task can no
+    longer be allowed to fail on a leader PR the snapshot block cannot use.
+    Every exit path writes every result, and a leader repo that owns no
+    components resolves to an empty group rather than exiting 1.
+
+    A third addition: each child component carries the head SHA of the PR it
+    came from, alongside the PR number.  RHOAI PR pipelines publish to a
+    shared repository keyed by commit rather than to the component's own
+    repository keyed by PR number, so the number alone cannot find the image.
+    generate-snapshot uses the SHA; see early-gate/PR-DIGESTS.md.
+
+    The org allowlist is a parameter rather than a constant for the same
+    reason: real component PRs live in red-hat-data-services, not in the
+    rhoai-rhtap forks, so gating them means naming that org explicitly.
+  workspaces:
+    - name: basic-auth
+      optional: true
+  params:
+    - name: leader-pr-repo
+      type: string
+      default: ""
+      description: |
+        org/repo of the leader PR.  Overrides the PaC labels when set; leave
+        empty to resolve from the pipelinesascode.tekton.dev labels instead.
+    - name: leader-pr-number
+      type: string
+      default: ""
+      description: Leader PR number.  Overrides the PaC label when set.
+    - name: operator-repo-name
+      type: string
+      default: "rhoai-rhtap/rhods-operator-gap"
+      description: |
+        org/repo of the operator.  When the leader PR references it, the
+        operator source is itself changing and source-branch resolves to
+        operator-source-branch.
+    - name: operator-source-branch
+      type: string
+      default: "main"
+      description: |
+        Branch to fork from when the leader PR includes the operator repo - the
+        branch that PR lands on.  A parameter rather than the literal "main" it
+        used to be, so that a deployment whose operator development branch is
+        named something else does not have to patch this task.
+    - name: fallback-source-branch
+      type: string
+      default: "stable"
+      description: Branch to fork from when the leader PR cannot be read
+    - name: triggering-branch
+      type: string
+      default: ""
+      description: |
+        The branch the gate run was triggered on - PaC's {{target_branch}},
+        passed down by the caller.  Empty keeps the historical behaviour.
+
+        When this names a branch that is neither operator-source-branch nor
+        fallback-source-branch, it wins outright and the operator-PR heuristic
+        below is skipped.  That heuristic answers "which of our two long-lived
+        branches holds the operator source for this group" - a question that
+        has no meaning on a dev branch, where the only sensible fork point is
+        the branch under test itself.  Forking from main or stable there would
+        gate code the PR does not contain, and report green for it.
+
+        It is deliberately not a blanket override: on main and stable the
+        heuristic still decides, because there the fork point genuinely depends
+        on whether the operator is one of the components changing.
+    - name: allowed-orgs
+      type: string
+      default: "rhoai-rhtap"
+      description: |
+        Space- or comma-separated GitHub orgs a child PR may come from.  A
+        child PR outside this list is skipped and reported, which is what
+        stops a leader PR from pulling an arbitrary third party's code into
+        the group.
+
+        The default is the fork org alone, matching the original behaviour.
+        A caller that also gates real component PRs - which live in
+        red-hat-data-services, not in the forks - has to say so explicitly.
+  results:
+    - name: group-components
+      description: Resolved components JSON with PR metadata for group testing
+    - name: has-group-config
+      description: true if group config found, false otherwise
+    - name: invalid-repo-warnings
+      description: Warning messages for repos not found in component_repo_map.json
+    - name: format-help-warning
+      description: Helpful message when earlygate is mentioned incorrectly or PR URLs found outside section
+    - name: source-branch
+      description: |
+        Branch to fork the ephemeral branch from.  operator-source-branch or
+        fallback-source-branch when the run was triggered on one of those;
+        otherwise the triggering branch itself.
+    - name: operator-pr-included
+      description: true when the leader PR references the operator repo
+    - name: component-count
+      description: Number of distinct rhoai-rhtap repos the leader PR references
+  volumes:
+    - name: workdir
+      emptyDir: {}
+  stepTemplate:
+    volumeMounts:
+      - mountPath: /var/workdir
+        name: workdir
+  steps:
+    - name: resolve-configuration
+      image: quay.io/konflux-ci/konflux-test:stable
+      workingDir: /workspace
+      env:
+        - name: PR_NUMBER
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['pipelinesascode.tekton.dev/pull-request']
+        - name: REPO_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['pipelinesascode.tekton.dev/url-repository']
+        - name: GITHUB_ORG
+          value: "rhoai-rhtap"
+        - name: LEADER_PR_REPO
+          value: $(params.leader-pr-repo)
+        - name: LEADER_PR_NUMBER
+          value: $(params.leader-pr-number)
+        - name: OPERATOR_REPO_NAME
+          value: $(params.operator-repo-name)
+        - name: FALLBACK_SOURCE_BRANCH
+          value: $(params.fallback-source-branch)
+        - name: OPERATOR_SOURCE_BRANCH
+          value: $(params.operator-source-branch)
+        - name: TRIGGERING_BRANCH
+          value: $(params.triggering-branch)
+        - name: ALLOWED_ORGS
+          value: $(params.allowed-orgs)
+        - name: WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND
+          value: $(workspaces.basic-auth.bound)
+        - name: WORKSPACE_BASIC_AUTH_DIRECTORY_PATH
+          value: $(workspaces.basic-auth.path)
+      script: |
+        #!/bin/bash
+        set -e
+
+        # --- Every result gets a value before anything can fail ---
+        # This task gates fork-operator-branch now, so an unwritten result is
+        # not a degraded snapshot, it is a dead pipeline.  Writing defaults
+        # first means every subsequent path - including the ones that give up
+        # early - leaves a complete, readable set of results behind.
+        # Which branch a run that never gets as far as decide_fork_source forks
+        # from.  On a dev branch that has to be the dev branch, not the
+        # fallback: an unreadable leader PR is a reason to stop guessing about
+        # the *group*, not a reason to go and gate stable instead of the branch
+        # the run was triggered on.
+        # Carried as its own flag, not inferred later by comparing
+        # DEFAULT_SOURCE_BRANCH to TRIGGERING_BRANCH: those two are equal when
+        # the run was triggered on the fallback branch itself, and that
+        # comparison would then take the dev-branch path on stable.
+        TRIGGER_IS_DEV_BRANCH="no"
+        DEFAULT_SOURCE_BRANCH="${FALLBACK_SOURCE_BRANCH}"
+        if [ -n "${TRIGGERING_BRANCH}" ] \
+           && [ "${TRIGGERING_BRANCH}" != "${OPERATOR_SOURCE_BRANCH}" ] \
+           && [ "${TRIGGERING_BRANCH}" != "${FALLBACK_SOURCE_BRANCH}" ]; then
+          TRIGGER_IS_DEV_BRANCH="yes"
+          DEFAULT_SOURCE_BRANCH="${TRIGGERING_BRANCH}"
+        fi
+
+        echo -n "{}"                       > "$(results.group-components.path)"
+        echo -n "false"                    > "$(results.has-group-config.path)"
+        echo -n ""                         > "$(results.invalid-repo-warnings.path)"
+        echo -n ""                         > "$(results.format-help-warning.path)"
+        echo -n "${DEFAULT_SOURCE_BRANCH}" > "$(results.source-branch.path)"
+        echo -n "false"                    > "$(results.operator-pr-included.path)"
+        echo -n "0"                        > "$(results.component-count.path)"
+
+        # Decides which branch the ephemeral branch is forked from, and records
+        # it.  An operator PR in the leader means the operator source itself is
+        # changing, so fork from main, where that PR lands; otherwise the
+        # operator source is whatever is released, so fork from stable.
+        #
+        # This scans the whole PR body rather than the Early Gate section: the
+        # fork decision must hold even for a leader PR whose body has no
+        # section this task can parse, which is precisely the case the separate
+        # check-leader-pr task used to cover.
+        decide_fork_source() {
+          local body="$1"
+          local op_repo listed count operator_included
+          op_repo=$(echo "${OPERATOR_REPO_NAME}" | tr 'A-Z' 'a-z')
+
+          # grep -c would count matching *lines*, and a PR body is frequently
+          # one line, so it would report 1 however many repos were listed.
+          listed=$(printf '%s' "${body}" \
+            | grep -oiE 'rhoai-rhtap/[A-Za-z0-9._-]+' | tr 'A-Z' 'a-z' | sort -u || true)
+          count=$(printf '%s' "${listed}" | grep -c . || true)
+
+          echo "Leader PR references ${count} rhoai-rhtap repo(s):" >&2
+          printf '%s\n' "${listed}" >&2
+          echo -n "${count}" > "$(results.component-count.path)"
+
+          # Recorded either way.  It describes the group, not the fork point,
+          # so the dev-branch path below still needs it for the snapshot.
+          if printf '%s' "${listed}" | grep -qixF "${op_repo}"; then
+            echo -n "true" > "$(results.operator-pr-included.path)"
+            operator_included="yes"
+          else
+            echo -n "false" > "$(results.operator-pr-included.path)"
+            operator_included="no"
+          fi
+
+          # A branch that is neither of the two long-lived ones gates itself.
+          # The test was made once at the top, so the early-exit paths and this
+          # one cannot drift.  See triggering-branch's description for why this
+          # short-circuits the heuristic rather than feeding into it.
+          if [ "${TRIGGER_IS_DEV_BRANCH}" = "yes" ]; then
+            echo "✓ Triggered on '${TRIGGERING_BRANCH}', which is neither ${OPERATOR_SOURCE_BRANCH} nor ${FALLBACK_SOURCE_BRANCH}" >&2
+            echo "  Forking from it directly (operator PR in group: ${operator_included})" >&2
+            echo -n "${TRIGGERING_BRANCH}" > "$(results.source-branch.path)"
+            return
+          fi
+
+          if [ "${operator_included}" = "yes" ]; then
+            echo "✓ Operator PR included - forking from ${OPERATOR_SOURCE_BRANCH}" >&2
+            echo -n "${OPERATOR_SOURCE_BRANCH}" > "$(results.source-branch.path)"
+          else
+            echo "✓ No operator PR - forking from ${FALLBACK_SOURCE_BRANCH}" >&2
+            echo -n "${FALLBACK_SOURCE_BRANCH}" > "$(results.source-branch.path)"
+          fi
+        }
+
+        # --- Leader PR parameters win over the PaC labels ---
+        # The RHOAI early-gate pipeline is not itself PaC-triggered, so the
+        # pipelinesascode.tekton.dev labels are absent and the fieldRefs above
+        # resolve to the empty string.  When the caller passes the leader PR
+        # explicitly, use it.
+        if [[ -n "${LEADER_PR_REPO}" ]]; then
+          GITHUB_ORG="${LEADER_PR_REPO%%/*}"
+          REPO_NAME="${LEADER_PR_REPO##*/}"
+        fi
+        if [[ -n "${LEADER_PR_NUMBER}" ]]; then
+          PR_NUMBER="${LEADER_PR_NUMBER}"
+        fi
+
+        echo "=== Resolve Group Configuration Task ===" >&2
+        echo "PR_NUMBER=${PR_NUMBER}" >&2
+        echo "REPO_NAME=${REPO_NAME}" >&2
+        echo "GITHUB_ORG=${GITHUB_ORG}" >&2
+
+        # --- Constants ---
+        EARLYGATE_SECTION_PATTERN="early.*gate"  # Matches "earlygate", "early gate", "early-gate", etc.  # Case-insensitive search in ## headings
+        # The Leader PR Manager emits "### Child PRs", not an Early Gate
+        # heading, so matching only the latter sent every real leader PR down
+        # the single-PR fallback.  Both forms list the same thing - the child
+        # PR URLs - so both are accepted as the section that holds them.
+        CHILD_PRS_SECTION_PATTERN="child.*prs"
+        SECTION_PATTERN="(${EARLYGATE_SECTION_PATTERN}|${CHILD_PRS_SECTION_PATTERN})"
+        COMPONENT_MAP_URL="https://raw.githubusercontent.com/rhoai-rhtap/konflux-central/main/config/component_repo_map.json"
+        # Normalised to one org per line so the membership test below is an
+        # exact whole-string match.  A substring test would let
+        # "rhoai-rhtap-evil" through on a list containing "rhoai-rhtap".
+        ALLOWED_ORG_LIST=$(printf '%s' "${ALLOWED_ORGS}" | tr ',' ' ' | tr -s ' ' '\n' | grep -v '^$' || true)
+        echo "Child PRs accepted from: $(printf '%s' "${ALLOWED_ORG_LIST}" | tr '\n' ' ')" >&2
+
+        # --- Fetch component_repo_map.json (critical dependency) ---
+        echo "Fetching component_repo_map.json..." >&2
+        COMPONENT_MAP=$(curl -sSf "${COMPONENT_MAP_URL}")
+        if [[ -z "${COMPONENT_MAP}" ]]; then
+          echo "ERROR: Failed to fetch component_repo_map.json" >&2
+          exit 1
+        fi
+        echo "Component map loaded successfully" >&2
+
+        # --- Fetch PR description from GitHub API ---
+        echo "Fetching PR description from GitHub..." >&2
+        GITHUB_API_URL="https://api.github.com/repos/${GITHUB_ORG}/${REPO_NAME}/pulls/${PR_NUMBER}"
+
+        # Use authentication if available
+        GITHUB_TOKEN=""
+        if [[ "${WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND}" == "true" ]]; then
+          echo "Checking for GitHub token in workspace..." >&2
+          if [[ -f "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.git-credentials" ]]; then
+            echo "Found .git-credentials file" >&2
+            # Format examples:
+            # https://TOKEN:x-oauth-basic@github.com
+            # https://x-access-token:TOKEN@github.com
+            # https://username:TOKEN@github.com
+            CREDS_LINE=$(cat "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.git-credentials" | grep github.com | head -1)
+
+            # Try different extraction patterns
+            # Pattern 1: https://TOKEN:x-oauth-basic@github.com
+            GITHUB_TOKEN=$(echo "${CREDS_LINE}" | sed -n 's|https://\([^:]*\):x-oauth-basic@github\.com.*|\1|p')
+
+            # Pattern 2: https://x-access-token:TOKEN@github.com
+            if [[ -z "${GITHUB_TOKEN}" ]]; then
+              GITHUB_TOKEN=$(echo "${CREDS_LINE}" | sed -n 's|https://x-access-token:\([^@]*\)@github\.com.*|\1|p')
+            fi
+
+            # Pattern 3: https://username:TOKEN@github.com (any username)
+            if [[ -z "${GITHUB_TOKEN}" ]]; then
+              GITHUB_TOKEN=$(echo "${CREDS_LINE}" | sed -n 's|https://[^:]*:\([^@]*\)@github\.com.*|\1|p')
+            fi
+          fi
+
+          # Also check for .github-token file (alternative location)
+          if [[ -z "${GITHUB_TOKEN}" && -f "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.github-token" ]]; then
+            echo "Found .github-token file" >&2
+            GITHUB_TOKEN=$(cat "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/.github-token")
+          fi
+
+          # RHOAI: the early-gate pipeline's github-credentials workspace is the
+          # eg-github-token secret, whose single key is 'token'.  Without this
+          # the task drops to the unauthenticated API, which is rate-limited
+          # per egress IP and shared across every Konflux build on the cluster.
+          if [[ -z "${GITHUB_TOKEN}" && -f "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/token" ]]; then
+            echo "Found token file" >&2
+            GITHUB_TOKEN=$(cat "${WORKSPACE_BASIC_AUTH_DIRECTORY_PATH}/token")
+          fi
+        fi
+
+        # Which Authorization scheme the token turned out to want, so that the
+        # second API call this task makes - the per-child-PR head SHA lookup
+        # below - does not have to rediscover it.  Empty means unauthenticated.
+        AUTH_SCHEME=""
+
+        if [[ -n "${GITHUB_TOKEN}" ]]; then
+          echo "Using authenticated GitHub API (token length: ${#GITHUB_TOKEN} chars)" >&2
+          # Try with 'token' prefix first (classic format)
+          AUTH_SCHEME="token"
+          PR_DATA=$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "${GITHUB_API_URL}" 2>&1)
+
+          # If that fails with 401, try with 'Bearer' prefix
+          if echo "${PR_DATA}" | grep -q "Bad credentials\|Requires authentication"; then
+            echo "Classic token auth failed, trying Bearer format..." >&2
+            AUTH_SCHEME="Bearer"
+            PR_DATA=$(curl -sS -H "Authorization: Bearer ${GITHUB_TOKEN}" "${GITHUB_API_URL}" 2>&1)
+          fi
+
+          # Check if still failing
+          if echo "${PR_DATA}" | grep -q "Bad credentials\|Requires authentication"; then
+            echo "ERROR: GitHub authentication failed with provided token" >&2
+            echo "Response: ${PR_DATA:0:200}" >&2
+            echo "Falling back to unauthenticated API..." >&2
+            AUTH_SCHEME=""
+            PR_DATA=$(curl -sSf "${GITHUB_API_URL}" 2>&1)
+          fi
+        else
+          echo "⚠️  WARNING: No GitHub authentication found, using unauthenticated API (rate limited)" >&2
+          PR_DATA=$(curl -sSf "${GITHUB_API_URL}" 2>&1)
+        fi
+
+        # Reuses whatever the ladder above settled on.  Never -f: a child PR
+        # that cannot be read is a degraded result, not a failed pipeline, and
+        # the caller checks the parsed value rather than the exit status.
+        gh_get() {
+          if [[ -n "${AUTH_SCHEME}" ]]; then
+            curl -sS -H "Authorization: ${AUTH_SCHEME} ${GITHUB_TOKEN}" "$1" || true
+          else
+            curl -sS "$1" || true
+          fi
+        }
+
+        if [[ -z "${PR_DATA}" ]]; then
+          echo "⚠️  WARNING: Failed to fetch PR description from GitHub API" >&2
+          echo "   Falling back to single-PR mode" >&2
+          echo -n "false" > "$(results.has-group-config.path)"
+          echo -n "" > "$(results.invalid-repo-warnings.path)"
+          echo -n "" > "$(results.format-help-warning.path)"
+          # Return components for current repo only
+          COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo] // {}')
+          echo -n "${COMPONENTS}" > "$(results.group-components.path)"
+          # source-branch keeps the fallback written at the top: the body could
+          # not be read, so there is nothing to base a better decision on.
+          echo "Fork source stays at the fallback (${FALLBACK_SOURCE_BRANCH})" >&2
+          exit 0
+        fi
+
+        PR_BODY=$(echo "${PR_DATA}" | jq -r '.body // ""')
+        echo "PR description fetched successfully" >&2
+
+        # Remove Windows line endings (CR) if present
+        PR_BODY=$(echo "${PR_BODY}" | tr -d '\r')
+
+        # --- Fork source decision ---
+        # Taken before any of the section parsing below, and from the whole
+        # body, so that it holds regardless of whether the component set can
+        # be resolved.  Orchestration must not depend on the snapshot.
+        echo "" >&2
+        echo "=== Fork Source Decision ===" >&2
+        decide_fork_source "${PR_BODY}"
+        echo "" >&2
+
+        # --- Search for the child PR section (## heading) ---
+        echo "Searching for a child PR section in the PR description..." >&2
+
+        # Check if there's a markdown heading naming the section (case-insensitive)
+        if ! echo "${PR_BODY}" | grep -qiE "^#.*${SECTION_PATTERN}"; then
+          echo "No Early Gate section found in PR description" >&2
+          echo "Using single-PR mode (repo: ${REPO_NAME}, pr: ${PR_NUMBER})" >&2
+          echo -n "false" > "$(results.has-group-config.path)"
+          echo -n "" > "$(results.invalid-repo-warnings.path)"
+
+          # --- Check for common mistakes and provide helpful guidance ---
+          FORMAT_HELP=""
+
+          # Check 1: "earlygate" mentioned but not in a heading
+          if echo "${PR_BODY}" | grep -qi "${EARLYGATE_SECTION_PATTERN}"; then
+            echo "Found 'earlygate' mention but not in a markdown heading" >&2
+            FORMAT_HELP="## ⚠️ Group Testing Format Issue"$'\n\n'"Found \`earlygate\` mentioned in your PR description, but it's not in the correct format for group testing."$'\n\n'"**To enable group testing, use this format:**"$'\n\n'"\`\`\`markdown"$'\n'"## Early Gate Testing"$'\n'"https://github.com/rhoai-rhtap/REPO/pull/NUMBER"$'\n'"\`\`\`"$'\n\n'"**Requirements:**"$'\n'"- Must be a markdown heading (# or ##) containing \"earlygate\""$'\n'"- Only PRs from \`rhoai-rhtap\` organization"$'\n\n'"See [Group Testing](https://github.com/rhoai-rhtap/konflux-central/tree/main/early-gate) for details."
+          else
+            # Check 2: GitHub PR URLs found in description
+            if echo "${PR_BODY}" | grep -q "https://github.com/rhoai-rhtap/[^/]*/pull/[0-9]"; then
+              echo "Found rhoai-rhtap PR URLs but not marked for group testing" >&2
+              FORMAT_HELP="## ℹ️ Group Testing Available"$'\n\n'"Found GitHub PR URLs in your description. If you want to test these PRs together, use group testing:"$'\n\n'"**Format:**"$'\n'"\`\`\`markdown"$'\n'"## Early Gate Testing"$'\n'"https://github.com/rhoai-rhtap/REPO/pull/NUMBER"$'\n'"\`\`\`"$'\n\n'"See [Group Testing](https://github.com/rhoai-rhtap/konflux-central/tree/main/early-gate) for details."
+            fi
+          fi
+
+          echo -n "${FORMAT_HELP}" > "$(results.format-help-warning.path)"
+
+          # Return components for current repo only.  A leader repo that is
+          # absent from the map is not an error: gated-artifacts-promoter
+          # publishes no images of its own, and the fork decision above has
+          # already been made and recorded.  Resolving to an empty group lets
+          # the snapshot block record "nothing to pin" and the orchestration
+          # behind it carry on, where exiting 1 here took the whole pipeline
+          # down with it.
+          COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo] // {}')
+          if [[ "${COMPONENTS}" == "{}" ]]; then
+            echo "⚠️  No entry for REPO_NAME=${REPO_NAME} in component_repo_map.json" >&2
+            echo "   Resolving to an empty component group." >&2
+          fi
+          echo -n "${COMPONENTS}" > "$(results.group-components.path)"
+          exit 0
+        fi
+
+        echo "✓ Child PR section found" >&2
+        echo -n "true" > "$(results.has-group-config.path)"
+        echo -n "" > "$(results.format-help-warning.path)"  # No format help needed
+
+        # --- Extract PR URLs from the child PR section ---
+        # Find the section and extract URLs until the next ## heading
+        # Allow optional whitespace and bullets/dashes before URLs
+        PR_URLS=$(echo "${PR_BODY}" | awk -v IGNORECASE=1 "
+          /^#+.*${SECTION_PATTERN}/ { found=1; next }
+          found && /^#+/ { exit }
+          found && /https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/[0-9]+/ {
+            match(\$0, /https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/[0-9]+/)
+            print substr(\$0, RSTART, RLENGTH)
+          }
+        " || true)
+
+        if [[ -z "${PR_URLS}" ]]; then
+          echo "⚠️  WARNING: No PR URLs found in Early Gate section" >&2
+          echo "   Falling back to single-PR mode" >&2
+          echo -n "false" > "$(results.has-group-config.path)"
+          echo -n "" > "$(results.invalid-repo-warnings.path)"
+          FORMAT_HELP="## ⚠️ Empty Early Gate Section"$'\n\n'"Found an Early Gate section in your PR description, but no PR URLs were listed."$'\n\n'"**Add PR URLs like this:**"$'\n'"\`\`\`markdown"$'\n'"## Early Gate Testing"$'\n'"https://github.com/rhoai-rhtap/REPO/pull/NUMBER"$'\n'"\`\`\`"$'\n\n'"See [Group Testing](https://github.com/rhoai-rhtap/konflux-central/tree/main/early-gate) for details."
+          echo -n "${FORMAT_HELP}" > "$(results.format-help-warning.path)"
+          COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo] // {}')
+          echo -n "${COMPONENTS}" > "$(results.group-components.path)"
+          exit 0
+        fi
+
+        echo "Found PR URLs:" >&2
+        echo "${PR_URLS}" >&2
+
+        # --- ALWAYS include leader PR's components first ---
+        echo "" >&2
+        echo "=== Resolving Components ===" >&2
+        echo "Step 1: Adding leader PR components (${REPO_NAME} #${PR_NUMBER})..." >&2
+        TEMP_COMPONENTS=$(mktemp)
+        echo "{}" > "${TEMP_COMPONENTS}"
+
+        # Initialize warnings tracking
+        WARNINGS=""
+
+        # Get leader PR components with PR metadata
+        LEADER_COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo]')
+        if [[ -n "${LEADER_COMPONENTS}" && "${LEADER_COMPONENTS}" != "null" ]]; then
+          LEADER_COMPONENTS_WITH_PR=$(echo "${LEADER_COMPONENTS}" | jq -c --arg pr "${PR_NUMBER}" '
+            to_entries |
+            map({
+              key: .key,
+              value: {
+                quay_path: .value,
+                pr: $pr
+              }
+            }) |
+            from_entries
+          ')
+          NUM_LEADER=$(echo "${LEADER_COMPONENTS_WITH_PR}" | jq 'length')
+          echo "✓ Added ${NUM_LEADER} components from leader PR #${PR_NUMBER}" >&2
+          echo "${LEADER_COMPONENTS_WITH_PR}" > "${TEMP_COMPONENTS}"
+        else
+          echo "⚠️  WARNING: No components found for leader repo: ${REPO_NAME}" >&2
+          echo "   This is unusual - verify component_repo_map.json has an entry for ${REPO_NAME}" >&2
+        fi
+
+        # --- Parse each collaborator PR URL and add their components ---
+        echo "" >&2
+        echo "Step 2: Adding collaborator PR components..." >&2
+        while IFS= read -r url; do
+          echo "Processing collaborator URL: ${url}" >&2
+
+          # Extract org/repo/pr from URL
+          # Format: https://github.com/{org}/{repo}/pull/{number}
+          if [[ ! "${url}" =~ ^https://github\.com/([^/]+)/([^/]+)/pull/([0-9]+)$ ]]; then
+            echo "⚠️  WARNING: Invalid PR URL format: ${url}" >&2
+            echo "   Skipping this entry" >&2
+            continue
+          fi
+
+          ORG="${BASH_REMATCH[1]}"
+          REPO="${BASH_REMATCH[2]}"
+          PR="${BASH_REMATCH[3]}"
+
+          echo "  Org: ${ORG}" >&2
+          echo "  Repo: ${REPO}" >&2
+          echo "  PR: ${PR}" >&2
+
+          # Security check: only allow PRs from an org the caller named
+          if ! printf '%s\n' "${ALLOWED_ORG_LIST}" | grep -qixF "${ORG}"; then
+            echo "⚠️  WARNING: PR from unauthorized organization: ${ORG}" >&2
+            echo "   Allowed: $(printf '%s' "${ALLOWED_ORG_LIST}" | tr '\n' ' ')" >&2
+            echo "   Skipping this entry" >&2
+            # Track warning for PR comment
+            WARNING_MSG="⚠️ PR from \`${ORG}/${REPO}\` (#${PR}) was skipped - only PRs from \`$(printf '%s' "${ALLOWED_ORG_LIST}" | tr '\n' ' ')\` are allowed."
+            if [[ -z "${WARNINGS}" ]]; then
+              WARNINGS="${WARNING_MSG}"
+            else
+              WARNINGS="${WARNINGS}"$'\n'"${WARNING_MSG}"
+            fi
+            continue
+          fi
+
+          # Lookup components for this repo in component_repo_map.json
+          REPO_COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO}" '.[$repo]')
+
+          if [[ -z "${REPO_COMPONENTS}" || "${REPO_COMPONENTS}" == "null" ]]; then
+            echo "⚠️  WARNING: No components found for repo: ${REPO}" >&2
+            echo "   Skipping this repo" >&2
+            # Track warning for PR comment
+            WARNING_MSG="⚠️ Repo \`${ORG}/${REPO}\` from PR #${PR} is not configured for early-gate testing and was skipped."
+            if [[ -z "${WARNINGS}" ]]; then
+              WARNINGS="${WARNING_MSG}"
+            else
+              WARNINGS="${WARNINGS}"$'\n'"${WARNING_MSG}"
+            fi
+            continue
+          fi
+
+          echo "  Found components for ${REPO}" >&2
+
+          # Head SHA of the child PR.
+          #
+          # generate-snapshot needs it to find the image this PR actually
+          # built.  RHOAI component PR pipelines do not follow the ODH
+          # convention the upstream task assumes: instead of tagging their own
+          # repository with the PR number, all of them publish to the single
+          # shared repository quay.io/rhoai/pull-request-pipelines under the
+          # tag <component>-<commit>.  The PR number alone cannot locate that
+          # image; the commit can.  See early-gate/PR-DIGESTS.md.
+          #
+          # Empty is a supported answer.  A PR that cannot be read just means
+          # generate-snapshot skips that probe and falls back to the release
+          # tag, which is what it did for every component before this existed.
+          PR_SHA=$(gh_get "https://api.github.com/repos/${ORG}/${REPO}/pulls/${PR}" \
+                     | jq -r '.head.sha // ""' 2>/dev/null || true)
+          if [[ -n "${PR_SHA}" ]]; then
+            echo "  Head SHA: ${PR_SHA}" >&2
+          else
+            echo "  ⚠️  Could not read head SHA for ${ORG}/${REPO}#${PR} - the" >&2
+            echo "      snapshot will fall back to the release tag for it." >&2
+          fi
+
+          # Add PR metadata to each component
+          # Transform: {"comp1": "path1", "comp2": "path2"}
+          # To: {"comp1": {"quay_path": "path1", "pr": "123", "sha": "abc..."}, ...}
+          REPO_COMPONENTS_WITH_PR=$(echo "${REPO_COMPONENTS}" | jq -c --arg pr "${PR}" --arg sha "${PR_SHA}" '
+            to_entries |
+            map({
+              key: .key,
+              value: {
+                quay_path: .value,
+                pr: $pr,
+                sha: $sha
+              }
+            }) |
+            from_entries
+          ')
+
+          echo "  Components with PR metadata:" >&2
+          echo "  ${REPO_COMPONENTS_WITH_PR}" >&2
+
+          # Merge into accumulated components
+          jq -s '.[0] * .[1]' "${TEMP_COMPONENTS}" <(echo "${REPO_COMPONENTS_WITH_PR}") > "${TEMP_COMPONENTS}.tmp"
+          mv "${TEMP_COMPONENTS}.tmp" "${TEMP_COMPONENTS}"
+
+        done <<< "${PR_URLS}"
+
+        # --- Output final components JSON ---
+        FINAL_COMPONENTS=$(cat "${TEMP_COMPONENTS}")
+
+        if [[ "${FINAL_COMPONENTS}" == "{}" ]]; then
+          echo "⚠️  WARNING: No valid components resolved from group configuration" >&2
+          echo "   Falling back to single-PR mode" >&2
+          echo -n "false" > "$(results.has-group-config.path)"
+          echo -n "" > "$(results.invalid-repo-warnings.path)"
+          echo -n "" > "$(results.format-help-warning.path)"
+          COMPONENTS=$(echo "${COMPONENT_MAP}" | jq -c --arg repo "${REPO_NAME}" '.[$repo] // {}')
+          echo -n "${COMPONENTS}" > "$(results.group-components.path)"
+        else
+          echo "✓ Group components resolved successfully:" >&2
+          echo "${FINAL_COMPONENTS}" | jq '.' >&2
+          echo -n "${FINAL_COMPONENTS}" > "$(results.group-components.path)"
+
+          # Output warnings if any
+          if [[ -n "${WARNINGS}" ]]; then
+            echo "" >&2
+            echo "⚠️  Invalid repo warnings:" >&2
+            echo "${WARNINGS}" >&2
+          fi
+          echo -n "${WARNINGS}" > "$(results.invalid-repo-warnings.path)"
+        fi
+
+        # Cleanup
+        rm -f "${TEMP_COMPONENTS}"
+
+        echo "=== Resolution complete ===" >&2

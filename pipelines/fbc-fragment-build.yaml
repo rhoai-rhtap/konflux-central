@@ -35,6 +35,28 @@ spec:
     description: Skip checks against built image
     name: skip-checks
     type: string
+  - default: "false"
+    description: |
+      Skip fbc-fips-check-oci-ta only, leaving every other check running.
+
+      Not a variant of skip-checks: that one is all-or-nothing, and the
+      thing it switches off first is validate-fbc, which is the only task
+      in the chain that checks opm schema and graph validity.  Needing to
+      drop the FIPS scan should not cost that.
+
+      The FIPS task scans every relatedImage the fragment references -
+      hundreds of them - and is the pipeline's longest task by a wide
+      margin, carrying its own timeout: 6h for the purpose.  That is
+      proportionate for a release build, where the scan is the deliverable.
+      It is not proportionate for the early gate, which is asking whether a
+      proposed catalog is structurally valid and references the digests it
+      should: the FIPS posture of already-released operand images is not
+      something a gate run can change, and scanning them again makes the
+      gate's slowest leg slower than the gate's own budget.
+
+      Leave it "false" for release builds.
+    name: skip-fips-check
+    type: string
   - default: "true"
     description: Execute the build with network isolation
     name: hermetic
@@ -116,6 +138,36 @@ spec:
     default: "true"
     type: string
     description: Show a slack notification on failure
+  - name: enable-slack-success-notification
+    default: "true"
+    type: string
+    description: |
+      Post the "a new build is available" message to Slack on success
+      (share-fbc-details).
+
+      Split out from enable-slack-failure-notification because the two fire on
+      opposite outcomes and only the failure one was switchable.  share-fbc-details
+      was guarded on tasks.status alone, so an early-gate build - which succeeds,
+      that being the point - announced an ephemeral eg-fbc-<uuid> branch to the
+      team channel as though it were a new CI build.
+
+      Defaults true: release builds are meant to announce themselves.
+  - name: enable-downstream-triggers
+    default: "true"
+    type: string
+    description: |
+      Dispatch the downstream GitHub workflows (conforma, smoke, disconnected
+      installer helper) when the build finishes.
+
+      Those tasks POST workflow_dispatch into red-hat-data-services repositories.
+      is_nightly already gates conforma and smoke, but it is a caller-supplied
+      default rather than a guarantee, and the disconnected-installer trigger was
+      guarded on `is_nightly in ["true","false"]` - every value the param can
+      hold, so it always ran.  An early-gate build must not reach release
+      automation at all, and that needs one switch that is true of all three
+      rather than three conditions to reason about.
+
+      Defaults true, so release behaviour is unchanged.
   - name: is_nightly
     type: string
     default: false
@@ -358,8 +410,15 @@ spec:
       - name: kind
         value: task
       resolver: bundles
+    # Two guards, both of which must pass.  Tekton ANDs when clauses, so
+    # skip-checks still switches this off with everything else, and
+    # skip-fips-check switches off this task alone.
     when:
     - input: $(params.skip-checks)
+      operator: in
+      values:
+      - "false"
+    - input: $(params.skip-fips-check)
       operator: in
       values:
       - "false"
@@ -654,9 +713,17 @@ spec:
       values:
       - "Completed"
       - "Succeeded"
+    - input: $(params.enable-slack-success-notification)
+      operator: in
+      values:
+      - "true"
   - name: trigger-conforma
     when:
     - input: $(params.is_nightly)
+      operator: in
+      values:
+      - "true"
+    - input: $(params.enable-downstream-triggers)
       operator: in
       values:
       - "true"
@@ -698,6 +765,10 @@ spec:
       operator: in
       values:
       - "true"
+    - input: $(params.enable-downstream-triggers)
+      operator: in
+      values:
+      - "true"
     taskSpec:
       steps:
       - name: trigger-workflow
@@ -731,12 +802,22 @@ spec:
           -H "Content-Type: application/json" \
           -d '{ "ref": "main", "inputs": { "target_branch": "'"$TARGET_BRANCH"'" } }'
   - name: trigger-disconnectec-installer-helper
+    # `is_nightly in ["true","false"]` is every value the param can hold, so
+    # this guard never excluded anything - it reads like a condition and
+    # behaves like "always".  Left as it is rather than removed, because
+    # whether the disconnected helper should be nightly-only is a release
+    # question, not an early-gate one; the new guard below is what keeps the
+    # gate out of it.
     when:
     - input: $(params.is_nightly)
       operator: in
       values:
       - "true"
       - "false"
+    - input: $(params.enable-downstream-triggers)
+      operator: in
+      values:
+      - "true"
     taskSpec:
       steps:
       - name: trigger-workflow
