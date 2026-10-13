@@ -309,8 +309,19 @@ spec:
         STATUS_CELL=":x: FAILED"
       fi
 
+      # The marker carries the three digests as key=value, and is an HTML
+      # comment so none of it renders.  Block 4 is comment-triggered - a
+      # /early-gate-test comment cannot carry parameters - so it recovers the
+      # digests from here rather than from the table below, which is laid out
+      # for people and may be reflowed without anyone thinking of the parser.
+      # Keep the marker name and the key=value shape stable; resolve-gate-
+      # artifacts in early-gate-test-pipeline.yaml reads them.
       {
-        echo "<!-- early-gate-build-complete -->"
+        echo "<!-- early-gate-build-complete"
+        echo "OPERATOR_IMAGE_REF_BY_DIGEST=${OPERATOR_IMAGE_REF}"
+        echo "BUNDLE_IMAGE_REF_BY_DIGEST=${BUNDLE_IMAGE_REF}"
+        echo "FBC_IMAGE_REF_BY_DIGEST=${FBC_IMAGE_REF}"
+        echo "-->"
         echo "${HEADING}"
         echo
         echo "| Field | Value |"
