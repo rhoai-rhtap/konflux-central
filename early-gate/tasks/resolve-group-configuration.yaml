@@ -102,6 +102,22 @@ spec:
         The default is the fork org alone, matching the original behaviour.
         A caller that also gates real component PRs - which live in
         red-hat-data-services, not in the forks - has to say so explicitly.
+    - name: rhoai-version
+      type: string
+      default: ""
+      description: |
+        Release this gate run is for, as "3.5" or "rhoai-3.5".  Used to
+        reconstruct the version suffix on component names.
+
+        component_repo_map.json holds bare names - odh-kserve-controller -
+        while the Konflux Components they stand for carry the release:
+        odh-kserve-controller-v3-5 on 3.5, -v3-6 on 3.6.  Keeping the suffix
+        in the file would have meant re-cutting all 122 entries every
+        Y-stream, so it is appended here instead.
+
+        Empty leaves the names bare and says so.  That is wrong for any real
+        run, but it is a loud kind of wrong - the snapshot keys visibly lack
+        the release - rather than a silent mismatch.
   results:
     - name: group-components
       description: Resolved components JSON with PR metadata for group testing
@@ -156,6 +172,8 @@ spec:
           value: $(params.triggering-branch)
         - name: ALLOWED_ORGS
           value: $(params.allowed-orgs)
+        - name: RHOAI_VERSION
+          value: $(params.rhoai-version)
         - name: WORKSPACE_BASIC_AUTH_DIRECTORY_BOUND
           value: $(workspaces.basic-auth.bound)
         - name: WORKSPACE_BASIC_AUTH_DIRECTORY_PATH
@@ -290,6 +308,44 @@ spec:
           exit 1
         fi
         echo "Component map loaded successfully" >&2
+
+        # --- Re-attach the release suffix the map no longer carries ---------
+        # The file holds bare names (odh-kserve-controller); the Konflux
+        # Components they stand for carry the release (odh-kserve-controller-v3-5).
+        # Appending here rather than storing it means a Y-stream bump is a
+        # parameter change, not 122 edits.
+        #
+        # Done once, to the whole map, rather than at each of the seven places
+        # that look a repo up - so no lookup can be forgotten later.
+        VERSION_SUFFIX=""
+        case "${RHOAI_VERSION}" in
+          "")
+            echo "WARNING: rhoai-version is empty; component names stay bare." >&2
+            echo "         Snapshot keys will not carry the release.  Pass" >&2
+            echo "         rhoai-version to get odh-<component>-vX-Y names." >&2
+            ;;
+          *)
+            # Accepts "3.5" and "rhoai-3.5"; anything else is not a release
+            STRIPPED="${RHOAI_VERSION#rhoai-}"
+            if [[ "${STRIPPED}" =~ ^([0-9]+)\.([0-9]+) ]]; then
+              VERSION_SUFFIX="-v${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+              echo "Component name suffix: ${VERSION_SUFFIX}" >&2
+            else
+              echo "ERROR: cannot derive a version suffix from rhoai-version='${RHOAI_VERSION}'." >&2
+              echo "       Expected <major>.<minor>, optionally rhoai- prefixed." >&2
+              exit 1
+            fi
+            ;;
+        esac
+
+        if [[ -n "${VERSION_SUFFIX}" ]]; then
+          COMPONENT_MAP=$(echo "${COMPONENT_MAP}" \
+            | jq -c --arg sfx "${VERSION_SUFFIX}" 'map_values(with_entries(.key |= . + $sfx))')
+          if [[ -z "${COMPONENT_MAP}" ]]; then
+            echo "ERROR: failed to apply the version suffix to the component map." >&2
+            exit 1
+          fi
+        fi
 
         # --- Fetch PR description from GitHub API ---
         echo "Fetching PR description from GitHub..." >&2

@@ -611,6 +611,8 @@ spec:
       value: $(params.triggering-branch)
     - name: allowed-orgs
       value: $(params.allowed-child-orgs)
+    - name: rhoai-version
+      value: $(params.rhoai-version)
     workspaces:
     # basic-auth here is a GitHub token, not a registry credential: this
     # task reads token/.git-credentials/.github-token out of it to call the
