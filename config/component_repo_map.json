@@ -232,5 +232,8 @@
   },
   "workload-variant-autoscaler": {
     "odh-workload-variant-autoscaler-controller": "rhoai/odh-workload-variant-autoscaler-controller-rhel9"
+  },
+  "odh-ai-first-demo": {
+    "odh-aiops-map-rhoai-test": "rhoai/odh-aiops-map-rhoai-test-rhel9"
   }
 }
